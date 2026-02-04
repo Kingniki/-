@@ -1756,6 +1756,247 @@ def visualize_solution(instance: EnRTSPDVSInstance, solution: Solution,
 
 # ==================== 实例生成 ====================
 
+def load_solomon_instance(
+    filepath: str,
+    num_customers: Optional[int] = None,
+    drone_speeds: List[float] = None,
+    truck_speed: float = 10.0,
+    battery_capacity: float = 800.0,
+    drone_max_load: float = 50.0,
+    truck_cost: float = 2.0,
+    drone_cost: float = 0.2,
+    energy_cost: float = 0.01,
+    wait_cost: float = 0.5,
+    coord_scale: float = 1.0,
+) -> EnRTSPDVSInstance:
+    """
+    解析Solomon标准算例文件并转换为 EnRTSPDVSInstance
+
+    Solomon格式:
+      行1: 实例名称 (如 C101)
+      行3: VEHICLE
+      行4: NUMBER     CAPACITY
+      行5: 25         200
+      行7: CUSTOMER
+      行8: CUST_NO.  XCOORD.  YCOORD.  DEMAND  READY_TIME  DUE_DATE  SERVICE_TIME
+      行9: (空行)
+      行10+: 数据行
+
+    参数:
+        filepath: Solomon .txt 文件路径
+        num_customers: 使用前N个客户 (None=全部, 100个客户对ALNS可能较慢)
+        drone_speeds: 无人机可用速度列表
+        truck_speed: 卡车速度
+        battery_capacity: 无人机电池容量 (Wh)
+        drone_max_load: 无人机最大载重
+        truck_cost: 卡车单位距离成本
+        drone_cost: 无人机单位距离成本
+        energy_cost: 无人机单位能耗成本
+        wait_cost: 等待成本
+        coord_scale: 坐标缩放因子 (Solomon坐标通常0-100, 可放大)
+
+    返回:
+        EnRTSPDVSInstance 实例
+    """
+    import os
+
+    node_coords = {}
+    customers = []
+    demands = {}
+    time_windows = {}
+    service_times = {}
+    instance_name = ""
+    vehicle_capacity = 200
+
+    with open(filepath, 'r') as f:
+        lines = f.readlines()
+
+    # 解析实例名称
+    instance_name = lines[0].strip()
+
+    # 解析车辆信息
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith("NUMBER") and "CAPACITY" in stripped:
+            # 下一行是数值
+            parts = lines[i + 1].split()
+            if len(parts) >= 2:
+                vehicle_capacity = int(parts[1])
+            break
+
+    # 解析客户数据
+    data_started = False
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        # 检查是否是数据行 (以数字开头)
+        parts = stripped.split()
+        if len(parts) >= 7:
+            try:
+                cust_no = int(parts[0])
+                x = float(parts[1]) * coord_scale
+                y = float(parts[2]) * coord_scale
+                demand = float(parts[3])
+                ready_time = float(parts[4])
+                due_date = float(parts[5])
+                service_time = float(parts[6])
+
+                node_coords[cust_no] = (x, y)
+                if cust_no == 0:
+                    # 仓库
+                    time_windows[cust_no] = (ready_time, due_date)
+                    service_times[cust_no] = service_time
+                    demands[cust_no] = demand
+                else:
+                    customers.append(cust_no)
+                    demands[cust_no] = demand
+                    time_windows[cust_no] = (ready_time, due_date)
+                    service_times[cust_no] = service_time
+                data_started = True
+            except ValueError:
+                continue
+
+    # 限制客户数量
+    if num_customers is not None and num_customers < len(customers):
+        customers = customers[:num_customers]
+        # 清理未使用的客户数据
+        all_used = set(customers) | {0}
+        node_coords = {k: v for k, v in node_coords.items() if k in all_used}
+        demands = {k: v for k, v in demands.items() if k in all_used}
+        time_windows = {k: v for k, v in time_windows.items() if k in all_used}
+        service_times = {k: v for k, v in service_times.items() if k in all_used}
+
+    print(f"    Solomon算例: {instance_name}")
+    print(f"    客户数量: {len(customers)} (文件中共{len(lines)-10}行数据)")
+    print(f"    车辆容量: {vehicle_capacity}")
+    print(f"    坐标范围: X=[{min(c[0] for c in node_coords.values()):.0f}, "
+          f"{max(c[0] for c in node_coords.values()):.0f}], "
+          f"Y=[{min(c[1] for c in node_coords.values()):.0f}, "
+          f"{max(c[1] for c in node_coords.values()):.0f}]")
+    print(f"    需求范围: [{min(demands[c] for c in customers):.0f}, "
+          f"{max(demands[c] for c in customers):.0f}]")
+    print(f"    坐标缩放: {coord_scale}x")
+
+    return EnRTSPDVSInstance(
+        node_coords=node_coords,
+        customers=customers,
+        depot=0,
+        demands=demands,
+        time_windows=time_windows,
+        service_times=service_times,
+        drone_speeds=drone_speeds or [12.0, 15.0, 18.0, 22.0, 25.0, 30.0],
+        truck_speed=truck_speed,
+        battery_capacity=battery_capacity,
+        drone_max_load=drone_max_load,
+        truck_cost=truck_cost,
+        drone_cost=drone_cost,
+        energy_cost=energy_cost,
+        wait_cost=wait_cost,
+    )
+
+
+def run_solomon_experiment(
+    filepath: str,
+    num_customers_list: List[int] = None,
+    max_iterations: int = 8000,
+    seed: int = 42,
+    coord_scale: float = 10.0,
+    save_path: str = None,
+):
+    """
+    使用Solomon算例进行批量实验
+
+    参数:
+        filepath: Solomon .txt 文件路径
+        num_customers_list: 客户数量列表, 如 [10, 25, 50, 100]
+        max_iterations: ALNS最大迭代次数
+        seed: 随机种子
+        coord_scale: 坐标缩放因子 (Solomon坐标0-100较小, 建议放大10倍使距离更合理)
+        save_path: 可视化图片保存路径 (None=不保存)
+    """
+    import os
+
+    if num_customers_list is None:
+        num_customers_list = [10, 25, 50]
+
+    print("=" * 70)
+    print("Solomon算例批量实验 - enRTSP-DVS")
+    print("=" * 70)
+    print(f"  算例文件: {os.path.basename(filepath)}")
+    print(f"  客户规模: {num_customers_list}")
+    print(f"  ALNS迭代: {max_iterations}")
+    print(f"  坐标缩放: {coord_scale}x")
+    print()
+
+    results = []
+
+    for num_c in num_customers_list:
+        print(f"\n{'='*60}")
+        print(f"实验: {num_c} 个客户")
+        print(f"{'='*60}")
+
+        print(f"\n[1] 加载Solomon算例...")
+        instance = load_solomon_instance(
+            filepath,
+            num_customers=num_c,
+            coord_scale=coord_scale,
+        )
+
+        print(f"\n[2] 求解...")
+        solver = ALNSSolver(
+            instance=instance,
+            seed=seed,
+            max_iterations=max_iterations,
+        )
+        solution = solver.solve(verbose=True)
+
+        # 打印结果
+        solver.print_solution(solution)
+
+        # 纯卡车对比
+        truck_only = get_truck_only_solution(instance)
+        improvement = 0.0
+        if truck_only.objective > 0:
+            improvement = (truck_only.objective - solution.objective) / truck_only.objective * 100
+
+        print(f"\n  纯卡车成本: {truck_only.objective:.2f}")
+        print(f"  ALNS成本: {solution.objective:.2f}")
+        print(f"  改进: {improvement:.2f}%")
+
+        results.append({
+            'num_customers': num_c,
+            'truck_only_cost': truck_only.objective,
+            'alns_cost': solution.objective,
+            'improvement_pct': improvement,
+            'num_drone_missions': len(solution.drone_missions),
+            'iterations': solver.stats['iterations'],
+            'best_iteration': solver.stats['best_found_iteration'],
+            'solve_time': solver.stats.get('solve_time', 0),
+        })
+
+        # 可视化
+        if save_path:
+            try:
+                img_path = os.path.join(save_path, f"solomon_{num_c}customers")
+                visualize_solution(instance, solution, save_path=img_path)
+            except Exception as e:
+                print(f"  可视化失败: {e}")
+
+    # 汇总报告
+    print(f"\n\n{'='*70}")
+    print("实验汇总")
+    print(f"{'='*70}")
+    print(f"{'客户数':>8} | {'纯卡车成本':>12} | {'ALNS成本':>12} | {'改进%':>8} | {'无人机任务':>10} | {'最优迭代':>8}")
+    print("-" * 70)
+    for r in results:
+        print(f"{r['num_customers']:>8} | {r['truck_only_cost']:>12.2f} | "
+              f"{r['alns_cost']:>12.2f} | {r['improvement_pct']:>7.2f}% | "
+              f"{r['num_drone_missions']:>10} | {r['best_iteration']:>8}")
+
+    return results
+
+
 def create_drone_friendly_instance(num_customers: int = 12, seed: int = 42) -> EnRTSPDVSInstance:
     """创建对无人机友好的实例"""
     random.seed(seed)
@@ -1866,42 +2107,40 @@ def get_truck_only_solution(instance: EnRTSPDVSInstance) -> Solution:
 # ==================== 主函数 ====================
 
 def main():
-    """主函数"""
+    """主函数 - 随机实例实验"""
     print("=" * 70)
     print("ALNS算法求解 enRTSP-DVS 问题")
     print("(弧中同步的速度可变无人机与卡车配送优化问题 - 途中起飞模型)")
     print("=" * 70)
-    
+
     # 配置
     NUM_CUSTOMERS = 15
     SEED = 42
     MAX_ITERATIONS = 8000
-    
+
     # 创建实例
     print("\n[1] 创建问题实例...")
     instance = create_drone_friendly_instance(num_customers=NUM_CUSTOMERS, seed=SEED)
-    
+
     print(f"    客户数量: {len(instance.customers)}")
     print(f"    仓库位置: {instance.node_coords[instance.depot]}")
     print(f"    卡车成本: {instance.truck_cost}")
     print(f"    无人机成本: {instance.drone_cost}")
-    
+
     # 求解
     print("\n[2] 初始化ALNS求解器...")
     solver = ALNSSolver(
         instance=instance,
         seed=SEED,
         max_iterations=MAX_ITERATIONS,
-        # initial_temperature=None → 自适应: T_st = 0.004 * f(s_init)
-        # reaction_factor=0.9, max_removal_ratio=0.20, no_improve_max=1000
     )
-    
+
     print("\n[3] 开始求解...")
     solution = solver.solve(verbose=True)
-    
+
     # 打印结果
     solver.print_solution(solution)
-    
+
     # 对比实验
     print("\n" + "=" * 60)
     print("[4] 对比实验...")
@@ -1911,17 +2150,138 @@ def main():
     if truck_only.objective > 0:
         improvement = (truck_only.objective - solution.objective) / truck_only.objective * 100
         print(f"  改进百分比: {improvement:.2f}%")
-    
+
     # 可视化
     print("\n[5] 生成可视化...")
     try:
-        visualize_solution(instance, solution, 
+        visualize_solution(instance, solution,
                           save_path=r"D:\研究生、\python\途中起飞+变速")
     except Exception as e:
         print(f"可视化失败: {e}")
-    
+
     return instance, solution, solver
 
 
+def main_solomon():
+    """
+    Solomon算例实验主函数
+
+    使用方法:
+    1. 单个实验:
+       instance = load_solomon_instance("c101.txt", num_customers=25, coord_scale=10.0)
+       solver = ALNSSolver(instance=instance, max_iterations=8000)
+       solution = solver.solve()
+
+    2. 批量实验:
+       run_solomon_experiment("c101.txt", num_customers_list=[10, 25, 50])
+
+    参数说明:
+    - coord_scale: Solomon坐标范围是0-100, 较小。建议放大10倍(coord_scale=10.0)
+      使得距离尺度与无人机速度(12-30 m/s)和电池容量(800 Wh)匹配
+    - num_customers: 100个客户计算较慢, 建议从25-50开始测试
+    - 可直接修改此函数中的参数进行实验
+    """
+    import os
+
+    # ========== 配置区 (修改这里进行不同实验) ==========
+
+    # Solomon算例文件路径 (修改为你的文件路径)
+    SOLOMON_FILE = "c101.txt"
+
+    # 实验模式选择:
+    #   "single"  - 单个规模实验 (快速测试)
+    #   "batch"   - 多个规模批量实验 (完整对比)
+    MODE = "single"
+
+    # 单个实验参数
+    SINGLE_NUM_CUSTOMERS = 25   # 使用前25个客户
+    MAX_ITERATIONS = 8000
+    SEED = 42
+
+    # 批量实验参数
+    BATCH_CUSTOMER_SIZES = [10, 25, 50]  # 可加 100 (较慢)
+
+    # 坐标缩放 (Solomon坐标0-100, 放大10倍 → 0-1000, 与无人机参数匹配)
+    COORD_SCALE = 10.0
+
+    # 可视化保存路径 (None=不保存, 设置路径则自动保存图片)
+    SAVE_PATH = None  # 例如 r"D:\研究生、\python\途中起飞+变速"
+
+    # ========== 执行区 ==========
+
+    # 检查文件是否存在
+    if not os.path.exists(SOLOMON_FILE):
+        # 尝试在脚本所在目录找
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        alt_path = os.path.join(script_dir, SOLOMON_FILE)
+        if os.path.exists(alt_path):
+            SOLOMON_FILE = alt_path
+        else:
+            print(f"错误: 找不到Solomon算例文件 '{SOLOMON_FILE}'")
+            print(f"请将文件放在当前目录或修改 SOLOMON_FILE 路径")
+            return None
+
+    if MODE == "batch":
+        results = run_solomon_experiment(
+            filepath=SOLOMON_FILE,
+            num_customers_list=BATCH_CUSTOMER_SIZES,
+            max_iterations=MAX_ITERATIONS,
+            seed=SEED,
+            coord_scale=COORD_SCALE,
+            save_path=SAVE_PATH,
+        )
+        return results
+    else:
+        # 单个实验
+        print("=" * 70)
+        print("Solomon算例单实验 - enRTSP-DVS")
+        print("=" * 70)
+
+        print(f"\n[1] 加载Solomon算例: {os.path.basename(SOLOMON_FILE)}")
+        instance = load_solomon_instance(
+            SOLOMON_FILE,
+            num_customers=SINGLE_NUM_CUSTOMERS,
+            coord_scale=COORD_SCALE,
+        )
+
+        print(f"\n[2] 初始化ALNS求解器...")
+        solver = ALNSSolver(
+            instance=instance,
+            seed=SEED,
+            max_iterations=MAX_ITERATIONS,
+        )
+
+        print(f"\n[3] 开始求解...")
+        solution = solver.solve(verbose=True)
+
+        solver.print_solution(solution)
+
+        # 对比
+        print("\n" + "=" * 60)
+        print("[4] 对比实验...")
+        truck_only = get_truck_only_solution(instance)
+        print(f"\n  纯卡车配送成本: {truck_only.objective:.2f}")
+        print(f"  ALNS求解成本: {solution.objective:.2f}")
+        if truck_only.objective > 0:
+            improvement = (truck_only.objective - solution.objective) / truck_only.objective * 100
+            print(f"  改进百分比: {improvement:.2f}%")
+
+        # 可视化
+        if SAVE_PATH:
+            print("\n[5] 生成可视化...")
+            try:
+                img_path = os.path.join(SAVE_PATH, f"solomon_c101_{SINGLE_NUM_CUSTOMERS}")
+                visualize_solution(instance, solution, save_path=img_path)
+            except Exception as e:
+                print(f"可视化失败: {e}")
+
+        return instance, solution, solver
+
+
 if __name__ == "__main__":
-    instance, solution, solver = main()
+    # ===== 选择运行模式 =====
+    # 使用随机实例:    main()
+    # 使用Solomon算例:  main_solomon()
+
+    # instance, solution, solver = main()
+    result = main_solomon()
