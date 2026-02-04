@@ -579,12 +579,10 @@ class ALNSSolver:
         核心思路: 基于移除客户后的卡车路线搜索起飞/回收点,
         确保无人机真正从弧的中间起飞和降落，而非在客户节点上。
 
-        改进点:
-        1. 在移除客户后的路线弧上搜索（真正的途中起飞）
-        2. 扩大搜索窗口到整条路线
-        3. 精细lambda搜索 (11个采样点 + 两阶段)
-        4. 遍历所有速度组合，基于时间同步选择最优速度
-        5. 考虑同步等待成本
+        性能优化:
+        - 弧搜索窗口限制为 ±5 (平衡质量与速度)
+        - 两阶段lambda搜索: 粗筛5点 -> 精搜仅对top-3候选
+        - 智能速度选择: 先用目标时间估算最佳速度，只测3个候选
         """
         route = solution.truck_route
 
@@ -618,102 +616,204 @@ class ALNSSolver:
         if num_arcs < 1:
             return None, 0
 
-        max_arc_span = min(num_arcs, max(8, num_arcs))
-        lambda_values = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+        # 找到客户在reduced_route中应该在的位置附近
+        # (prev_node和next_node在reduced_route中相邻)
+        center_idx = 0
+        for i in range(len(reduced_arcs)):
+            if reduced_arcs[i] == (prev_node, next_node):
+                center_idx = i
+                break
 
-        # 两阶段搜索
+        # 限制搜索范围: 中心 ±5 弧
+        ARC_WINDOW = 5
+        arc_start = max(0, center_idx - ARC_WINDOW)
+        arc_end = min(num_arcs, center_idx + ARC_WINDOW + 1)
+
+        # 排序的速度列表（用于智能速度选择）
+        sorted_speeds = sorted(self.instance.drone_speeds)
+        battery_limit = self.instance.battery_capacity * (1 - self.instance.safety_margin)
+
+        # 阶段1: 粗筛lambda + 快速速度选择 -> 收集候选
         coarse_lambdas = [0.0, 0.3, 0.5, 0.7, 1.0]
-        candidates = []
+        candidates = []  # (saving, launch_idx, recover_idx, lam_l, lam_r, speed_out, speed_ret)
 
-        for launch_arc_idx in range(num_arcs):
+        for launch_arc_idx in range(arc_start, arc_end):
             launch_arc = reduced_arcs[launch_arc_idx]
-            for recover_arc_idx in range(launch_arc_idx, min(num_arcs, launch_arc_idx + max_arc_span)):
+            for recover_arc_idx in range(launch_arc_idx, min(num_arcs, launch_arc_idx + ARC_WINDOW + 1)):
                 recover_arc = reduced_arcs[recover_arc_idx]
 
-                # 粗筛: 用中间lambda测试距离可行性
-                mid_lam_l = coarse_lambdas[len(coarse_lambdas) // 2]
-                mid_lam_r = coarse_lambdas[len(coarse_lambdas) // 2]
-                lp = self.instance.get_point_on_arc(launch_arc[0], launch_arc[1], mid_lam_l)
-                rp = self.instance.get_point_on_arc(recover_arc[0], recover_arc[1], mid_lam_r)
-                d_out = self.instance.euclidean_distance(lp, customer_coords)
-                d_ret = self.instance.euclidean_distance(customer_coords, rp)
+                for lam_launch in coarse_lambdas:
+                    launch_point = self.instance.get_point_on_arc(
+                        launch_arc[0], launch_arc[1], lam_launch)
+                    dist_out = self.instance.euclidean_distance(launch_point, customer_coords)
 
-                # 快速电池检查
-                min_speed = self.instance.drone_speeds[1] if len(self.instance.drone_speeds) > 1 \
-                    else self.instance.drone_speeds[0]
-                min_energy = self.instance.energy_model.energy_for_distance(
-                    payload, min_speed, d_out + d_ret)
-                if min_energy > self.instance.battery_capacity * (1 - self.instance.safety_margin) * 1.5:
-                    continue
+                    for lam_recover in coarse_lambdas:
+                        if launch_arc_idx == recover_arc_idx and lam_recover <= lam_launch:
+                            continue
 
-                candidates.append((launch_arc_idx, recover_arc_idx))
+                        recover_point = self.instance.get_point_on_arc(
+                            recover_arc[0], recover_arc[1], lam_recover)
+                        dist_ret = self.instance.euclidean_distance(customer_coords, recover_point)
 
-        # 阶段2: 精细搜索
-        for launch_arc_idx, recover_arc_idx in candidates:
-            launch_arc = reduced_arcs[launch_arc_idx]
-            recover_arc = reduced_arcs[recover_arc_idx]
+                        # 卡车段时间
+                        truck_seg_time = self.instance.calculate_truck_segment_time(
+                            reduced_route, launch_arc_idx, recover_arc_idx, lam_launch, lam_recover)
 
-            for lam_launch in lambda_values:
-                launch_point = self.instance.get_point_on_arc(
-                    launch_arc[0], launch_arc[1], lam_launch)
-                dist_out = self.instance.euclidean_distance(launch_point, customer_coords)
+                        # 智能速度选择: 找匹配truck_seg_time的速度
+                        best_combo = self._select_best_speed_combo(
+                            payload, dist_out, dist_ret, service_time,
+                            truck_seg_time, battery_limit, sorted_speeds)
 
-                for lam_recover in lambda_values:
-                    if launch_arc_idx == recover_arc_idx and lam_recover <= lam_launch:
-                        continue
+                        if best_combo is None:
+                            continue
 
-                    recover_point = self.instance.get_point_on_arc(
-                        recover_arc[0], recover_arc[1], lam_recover)
-                    dist_ret = self.instance.euclidean_distance(customer_coords, recover_point)
+                        s_out, s_ret, total_cost = best_combo
+                        saving = truck_detour_cost - total_cost
 
-                    # 卡车段时间（基于reduced_route）
-                    truck_segment_time = self.instance.calculate_truck_segment_time(
-                        reduced_route, launch_arc_idx, recover_arc_idx, lam_launch, lam_recover)
+                        if saving > 0:
+                            candidates.append((saving, launch_arc_idx, recover_arc_idx,
+                                             lam_launch, lam_recover, s_out, s_ret))
 
-                    # 遍历速度组合
-                    for speed_out in self.instance.drone_speeds:
-                        energy_out = self.instance.energy_model.energy_for_distance(
-                            payload, speed_out, dist_out)
-                        time_out = dist_out / speed_out if speed_out > 0 else float('inf')
+                        if saving > best_saving:
+                            best_saving = saving
+                            best_mission = DroneMission(
+                                launch_arc_start=launch_arc[0],
+                                launch_arc_end=launch_arc[1],
+                                lambda_launch=lam_launch,
+                                customer=customer,
+                                recover_arc_start=recover_arc[0],
+                                recover_arc_end=recover_arc[1],
+                                lambda_recover=lam_recover,
+                                outbound_speed=s_out,
+                                return_speed=s_ret
+                            )
 
-                        for speed_ret in self.instance.drone_speeds:
-                            energy_ret = self.instance.energy_model.energy_for_distance(
-                                0, speed_ret, dist_ret)
-                            total_energy = energy_out + energy_ret
+        # 阶段2: 对top候选做精细lambda搜索
+        if candidates:
+            candidates.sort(key=lambda x: x[0], reverse=True)
+            fine_lambdas = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
 
-                            # 电池约束
-                            if total_energy > self.instance.battery_capacity * (1 - self.instance.safety_margin):
-                                continue
+            for _, la_idx, re_idx, _, _, _, _ in candidates[:3]:
+                launch_arc = reduced_arcs[la_idx]
+                recover_arc = reduced_arcs[re_idx]
 
-                            time_ret = dist_ret / speed_ret if speed_ret > 0 else float('inf')
-                            drone_total_time = time_out + service_time + time_ret
+                for lam_launch in fine_lambdas:
+                    launch_point = self.instance.get_point_on_arc(
+                        launch_arc[0], launch_arc[1], lam_launch)
+                    dist_out = self.instance.euclidean_distance(launch_point, customer_coords)
 
-                            # 同步等待
-                            wait_time = abs(drone_total_time - truck_segment_time)
-                            wait_cost = wait_time * self.instance.wait_cost
+                    for lam_recover in fine_lambdas:
+                        if la_idx == re_idx and lam_recover <= lam_launch:
+                            continue
 
-                            # 总无人机成本
-                            drone_dist_cost = (dist_out + dist_ret) * self.instance.drone_cost
-                            energy_cost_val = total_energy * self.instance.energy_cost
-                            total_drone_cost = drone_dist_cost + energy_cost_val + wait_cost
+                        recover_point = self.instance.get_point_on_arc(
+                            recover_arc[0], recover_arc[1], lam_recover)
+                        dist_ret = self.instance.euclidean_distance(customer_coords, recover_point)
 
-                            saving = truck_detour_cost - total_drone_cost
+                        truck_seg_time = self.instance.calculate_truck_segment_time(
+                            reduced_route, la_idx, re_idx, lam_launch, lam_recover)
 
-                            if saving > best_saving:
-                                best_saving = saving
-                                best_mission = DroneMission(
-                                    launch_arc_start=launch_arc[0],
-                                    launch_arc_end=launch_arc[1],
-                                    lambda_launch=lam_launch,
-                                    customer=customer,
-                                    recover_arc_start=recover_arc[0],
-                                    recover_arc_end=recover_arc[1],
-                                    lambda_recover=lam_recover,
-                                    outbound_speed=speed_out,
-                                    return_speed=speed_ret
-                                )
+                        best_combo = self._select_best_speed_combo(
+                            payload, dist_out, dist_ret, service_time,
+                            truck_seg_time, battery_limit, sorted_speeds)
+
+                        if best_combo is None:
+                            continue
+
+                        s_out, s_ret, total_cost = best_combo
+                        saving = truck_detour_cost - total_cost
+
+                        if saving > best_saving:
+                            best_saving = saving
+                            best_mission = DroneMission(
+                                launch_arc_start=launch_arc[0],
+                                launch_arc_end=launch_arc[1],
+                                lambda_launch=lam_launch,
+                                customer=customer,
+                                recover_arc_start=recover_arc[0],
+                                recover_arc_end=recover_arc[1],
+                                lambda_recover=lam_recover,
+                                outbound_speed=s_out,
+                                return_speed=s_ret
+                            )
 
         return best_mission, best_saving
+
+    def _select_best_speed_combo(
+        self, payload: float, dist_out: float, dist_ret: float,
+        service_time: float, truck_seg_time: float,
+        battery_limit: float, sorted_speeds: List[float]
+    ) -> Optional[Tuple[float, float, float]]:
+        """
+        智能速度选择: 基于目标同步时间选择最佳速度组合
+
+        策略:
+        1. 计算目标飞行时间 = truck_seg_time - service_time
+        2. 找最接近目标时间的速度（同步优先）
+        3. 同时测试最快速度（最小等待）和最节能速度
+        返回: (speed_out, speed_ret, total_cost) 或 None
+        """
+        target_flight_time = max(0.1, truck_seg_time - service_time)
+        total_dist = dist_out + dist_ret
+
+        best_result = None
+        best_cost = float('inf')
+
+        # 候选速度策略
+        speed_candidates = set()
+
+        # 策略1: 匹配目标时间的速度
+        if total_dist > 0 and target_flight_time > 0:
+            target_speed = total_dist / target_flight_time
+            # 找最接近的可用速度
+            closest = min(sorted_speeds, key=lambda v: abs(v - target_speed))
+            speed_candidates.add(closest)
+            # 也加上相邻速度
+            idx = sorted_speeds.index(closest)
+            if idx > 0:
+                speed_candidates.add(sorted_speeds[idx - 1])
+            if idx < len(sorted_speeds) - 1:
+                speed_candidates.add(sorted_speeds[idx + 1])
+
+        # 策略2: 最快速度（最小飞行时间）
+        speed_candidates.add(sorted_speeds[-1])
+
+        # 策略3: 最慢可行速度（最节能）
+        speed_candidates.add(sorted_speeds[0])
+
+        # 测试所有候选组合
+        for s_out in speed_candidates:
+            if dist_out > 0:
+                energy_out = self.instance.energy_model.energy_for_distance(payload, s_out, dist_out)
+                time_out = dist_out / s_out
+            else:
+                energy_out = 0
+                time_out = 0
+
+            for s_ret in speed_candidates:
+                if dist_ret > 0:
+                    energy_ret = self.instance.energy_model.energy_for_distance(0, s_ret, dist_ret)
+                    time_ret = dist_ret / s_ret
+                else:
+                    energy_ret = 0
+                    time_ret = 0
+
+                total_energy = energy_out + energy_ret
+                if total_energy > battery_limit:
+                    continue
+
+                drone_time = time_out + service_time + time_ret
+                wait_time = abs(drone_time - truck_seg_time)
+
+                cost = ((dist_out + dist_ret) * self.instance.drone_cost +
+                        total_energy * self.instance.energy_cost +
+                        wait_time * self.instance.wait_cost)
+
+                if cost < best_cost:
+                    best_cost = cost
+                    best_result = (s_out, s_ret, cost)
+
+        return best_result
     
     # ==================== 破坏算子 ====================
     
@@ -982,6 +1082,8 @@ class ALNSSolver:
 
         直接基于当前卡车路线的弧结构搜索起飞/回收点,
         不需要客户在路线中（真正的外部分配）
+
+        性能优化: 限制弧窗口 + 智能速度选择
         """
         route = solution.truck_route
         arcs = solution.get_arcs()
@@ -997,19 +1099,36 @@ class ALNSSolver:
         payload = self.instance.demands.get(customer, 0)
         service_time = self.instance.service_times.get(customer, 0)
 
-        lambda_values = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
+        sorted_speeds = sorted(self.instance.drone_speeds)
+        battery_limit = self.instance.battery_capacity * (1 - self.instance.safety_margin)
 
-        for launch_arc_idx in range(num_arcs):
+        # 找离客户最近的弧作为搜索中心
+        best_center = 0
+        best_center_dist = float('inf')
+        for i, (a, b) in enumerate(arcs):
+            mid = self.instance.get_point_on_arc(a, b, 0.5)
+            d = self.instance.euclidean_distance(mid, customer_coords)
+            if d < best_center_dist:
+                best_center_dist = d
+                best_center = i
+
+        ARC_WINDOW = 5
+        arc_start = max(0, best_center - ARC_WINDOW)
+        arc_end = min(num_arcs, best_center + ARC_WINDOW + 1)
+
+        coarse_lambdas = [0.0, 0.3, 0.5, 0.7, 1.0]
+
+        for launch_arc_idx in range(arc_start, arc_end):
             launch_arc = arcs[launch_arc_idx]
-            for recover_arc_idx in range(launch_arc_idx, min(num_arcs, launch_arc_idx + 8)):
+            for recover_arc_idx in range(launch_arc_idx, min(num_arcs, launch_arc_idx + ARC_WINDOW + 1)):
                 recover_arc = arcs[recover_arc_idx]
 
-                for lam_launch in lambda_values:
+                for lam_launch in coarse_lambdas:
                     launch_point = self.instance.get_point_on_arc(
                         launch_arc[0], launch_arc[1], lam_launch)
                     dist_out = self.instance.euclidean_distance(launch_point, customer_coords)
 
-                    for lam_recover in lambda_values:
+                    for lam_recover in coarse_lambdas:
                         if launch_arc_idx == recover_arc_idx and lam_recover <= lam_launch:
                             continue
 
@@ -1017,49 +1136,34 @@ class ALNSSolver:
                             recover_arc[0], recover_arc[1], lam_recover)
                         dist_ret = self.instance.euclidean_distance(customer_coords, recover_point)
 
-                        truck_segment_time = self.instance.calculate_truck_segment_time(
+                        truck_seg_time = self.instance.calculate_truck_segment_time(
                             route, launch_arc_idx, recover_arc_idx, lam_launch, lam_recover)
 
-                        # 尝试速度组合（优化: 只试代表性速度）
-                        for speed_out in self.instance.drone_speeds:
-                            time_out = dist_out / speed_out
-                            energy_out = self.instance.energy_model.energy_for_distance(
-                                payload, speed_out, dist_out)
+                        combo = self._select_best_speed_combo(
+                            payload, dist_out, dist_ret, service_time,
+                            truck_seg_time, battery_limit, sorted_speeds)
 
-                            for speed_ret in self.instance.drone_speeds:
-                                energy_ret = self.instance.energy_model.energy_for_distance(
-                                    0, speed_ret, dist_ret)
-                                total_energy = energy_out + energy_ret
+                        if combo is None:
+                            continue
 
-                                if total_energy > self.instance.battery_capacity * (1 - self.instance.safety_margin):
-                                    continue
+                        s_out, s_ret, cost = combo
 
-                                time_ret = dist_ret / speed_ret
-                                drone_total_time = time_out + service_time + time_ret
-                                wait_time = abs(drone_total_time - truck_segment_time)
+                        if cost < best_cost:
+                            best_cost = cost
+                            best_mission = DroneMission(
+                                launch_arc_start=launch_arc[0],
+                                launch_arc_end=launch_arc[1],
+                                lambda_launch=lam_launch,
+                                customer=customer,
+                                recover_arc_start=recover_arc[0],
+                                recover_arc_end=recover_arc[1],
+                                lambda_recover=lam_recover,
+                                outbound_speed=s_out,
+                                return_speed=s_ret
+                            )
 
-                                cost = ((dist_out + dist_ret) * self.instance.drone_cost +
-                                        total_energy * self.instance.energy_cost +
-                                        wait_time * self.instance.wait_cost)
-
-                                if cost < best_cost:
-                                    best_cost = cost
-                                    best_mission = DroneMission(
-                                        launch_arc_start=launch_arc[0],
-                                        launch_arc_end=launch_arc[1],
-                                        lambda_launch=lam_launch,
-                                        customer=customer,
-                                        recover_arc_start=recover_arc[0],
-                                        recover_arc_end=recover_arc[1],
-                                        lambda_recover=lam_recover,
-                                        outbound_speed=speed_out,
-                                        return_speed=speed_ret
-                                    )
-
-        # 返回 (mission, saving) -- saving 为正表示比不服务好
-        # 对外部客户，saving = 正值意味着成本低于某阈值
         if best_mission is not None:
-            return best_mission, max(0, 50 - best_cost)  # 使用一个baseline阈值
+            return best_mission, max(0, 50 - best_cost)
         return None, 0
     
     def _calculate_insertion_cost(self, solution: Solution, customer: int, pos: int) -> float:
