@@ -570,11 +570,69 @@ class ALNSSolver:
                 if improved:
                     break
     
+    # ==================== 无人机任务不重叠约束 ====================
+
+    def _get_mission_route_position(
+        self, mission: DroneMission, arcs: List[Tuple[int, int]]
+    ) -> Optional[Tuple[float, float]]:
+        """
+        计算无人机任务在卡车路线上的线性位置区间 [start_pos, end_pos]
+
+        位置表示: arc_index + lambda, 例如在第3条弧的λ=0.7处 → 3.7
+        返回 None 如果弧不在路线中
+        """
+        launch_arc = (mission.launch_arc_start, mission.launch_arc_end)
+        recover_arc = (mission.recover_arc_start, mission.recover_arc_end)
+
+        if launch_arc not in arcs or recover_arc not in arcs:
+            return None
+
+        launch_idx = arcs.index(launch_arc)
+        recover_idx = arcs.index(recover_arc)
+
+        start_pos = launch_idx + mission.lambda_launch
+        end_pos = recover_idx + mission.lambda_recover
+
+        return (start_pos, end_pos)
+
+    def _check_mission_overlap(
+        self, new_mission: DroneMission,
+        existing_missions: List[DroneMission],
+        arcs: List[Tuple[int, int]]
+    ) -> bool:
+        """
+        检查新任务是否与已有任务在卡车路线上的时间窗口重叠
+
+        单无人机约束: 无人机必须从上一个任务回收后才能执行下一个任务
+        即任何两个任务的 [start_pos, end_pos] 区间不能重叠
+
+        返回: True 如果有重叠 (冲突), False 如果无重叠 (可行)
+        """
+        new_pos = self._get_mission_route_position(new_mission, arcs)
+        if new_pos is None:
+            return True  # 弧不存在视为冲突
+
+        new_start, new_end = new_pos
+
+        for existing in existing_missions:
+            ex_pos = self._get_mission_route_position(existing, arcs)
+            if ex_pos is None:
+                continue
+
+            ex_start, ex_end = ex_pos
+
+            # 两个区间重叠条件: start1 < end2 AND start2 < end1
+            if new_start < ex_end and ex_start < new_end:
+                return True  # 重叠
+
+        return False  # 无重叠
+
     def _initial_drone_assignment(self, solution: Solution):
         """
         初始解中的无人机分配
 
         改进: 使用完整路线弧验证, 允许同弧起飞/回收 (launch_idx <= recover_idx)
+        添加: 无人机任务不重叠约束 (单无人机同一时间只能执行一个任务)
         """
         arcs = solution.get_arcs()
 
@@ -601,7 +659,7 @@ class ALNSSolver:
         # 按节省排序
         candidates.sort(key=lambda x: x[3], reverse=True)
 
-        # 分配无人机任务
+        # 分配无人机任务（检查不重叠）
         assigned_customers = set()
         for customer, idx, mission, saving in candidates:
             if customer not in assigned_customers:
@@ -615,8 +673,10 @@ class ALNSSolver:
                     recover_idx = current_arcs.index(recover_arc)
 
                     if launch_idx <= recover_idx:  # 允许同弧（途中起飞同弧回收）
-                        solution.drone_missions.append(mission)
-                        assigned_customers.add(customer)
+                        # 检查与已有任务的时间窗口重叠
+                        if not self._check_mission_overlap(mission, solution.drone_missions, current_arcs):
+                            solution.drone_missions.append(mission)
+                            assigned_customers.add(customer)
 
         self._evaluate_solution(solution)
     
@@ -1105,6 +1165,7 @@ class ALNSSolver:
 
         改进: 先在当前路线上尝试无人机任务（不插入客户到卡车路线），
               成功则仅添加drone mission；失败则回退到卡车插入。
+        添加: 无人机任务不重叠约束检查
         """
         remaining = customers.copy()
         drone_assigned = set()
@@ -1119,32 +1180,38 @@ class ALNSSolver:
                 solution, customer)
 
             if mission is not None and saving > 0:
-                solution.drone_missions.append(mission)
-                drone_assigned.add(customer)
-                remaining.remove(customer)
-            else:
-                # 无人机不划算，先插入卡车路线再尝试
-                best_pos = 1
-                best_cost = float('inf')
-                for pos in range(1, len(solution.truck_route)):
-                    cost = self._calculate_insertion_cost(solution, customer, pos)
-                    if cost < best_cost:
-                        best_cost = cost
-                        best_pos = pos
+                # 检查不重叠约束
+                current_arcs = solution.get_arcs()
+                if not self._check_mission_overlap(mission, solution.drone_missions, current_arcs):
+                    solution.drone_missions.append(mission)
+                    drone_assigned.add(customer)
+                    remaining.remove(customer)
+                    continue
 
-                solution.truck_route.insert(best_pos, customer)
-                self._ensure_closed_route(solution)
+            # 无人机不划算或重叠，先插入卡车路线再尝试
+            best_pos = 1
+            best_cost = float('inf')
+            for pos in range(1, len(solution.truck_route)):
+                cost = self._calculate_insertion_cost(solution, customer, pos)
+                if cost < best_cost:
+                    best_cost = cost
+                    best_pos = pos
 
-                # 插入后再次尝试创建无人机任务
-                customer_idx = solution.truck_route.index(customer)
-                mission2, saving2 = self._find_best_drone_mission(
-                    solution, customer, customer_idx)
+            solution.truck_route.insert(best_pos, customer)
+            self._ensure_closed_route(solution)
 
-                if mission2 is not None and saving2 > 0:
+            # 插入后再次尝试创建无人机任务
+            customer_idx = solution.truck_route.index(customer)
+            mission2, saving2 = self._find_best_drone_mission(
+                solution, customer, customer_idx)
+
+            if mission2 is not None and saving2 > 0:
+                current_arcs = solution.get_arcs()
+                if not self._check_mission_overlap(mission2, solution.drone_missions, current_arcs):
                     solution.drone_missions.append(mission2)
                     drone_assigned.add(customer)
 
-                remaining.remove(customer)
+            remaining.remove(customer)
 
         # 阶段2: 剩余客户贪婪插入卡车路线
         for customer in remaining:
@@ -1353,12 +1420,25 @@ class ALNSSolver:
             wait_time = abs(drone_time - truck_segment_time)
             total_cost += wait_time * self.instance.wait_cost
 
-        # 3. 检查可行性
+        # 3. 无人机任务不重叠约束
+        # 单无人机: 任何两个任务的路线区间不能重叠
+        mission_positions = []
+        for mission in solution.drone_missions:
+            pos = self._get_mission_route_position(mission, actual_arcs)
+            if pos is not None:
+                mission_positions.append(pos)
+
+        mission_positions.sort(key=lambda p: p[0])
+        for i in range(len(mission_positions) - 1):
+            if mission_positions[i][1] > mission_positions[i + 1][0]:
+                total_cost += 1e5  # 重叠惩罚
+
+        # 4. 检查可行性
         served = solution.get_truck_served_customers(depot) | drone_served
         unserved = set(self.instance.customers) - served
         if unserved:
             total_cost += len(unserved) * 1e6
-        
+
         solution.objective = total_cost
     
     # ==================== 自适应权重更新 ====================
@@ -1540,6 +1620,22 @@ class ALNSSolver:
             # 速度多样性
             unique_speeds = len(speed_usage)
             print(f"  使用了 {unique_speeds}/{len(self.instance.drone_speeds)} 种不同速度")
+
+            # 任务重叠检查
+            mission_positions = []
+            for m in solution.drone_missions:
+                pos = self._get_mission_route_position(m, actual_arcs_for_print)
+                if pos is not None:
+                    mission_positions.append((m.customer, pos[0], pos[1]))
+            mission_positions.sort(key=lambda x: x[1])
+            overlap_count = 0
+            for i in range(len(mission_positions) - 1):
+                if mission_positions[i][2] > mission_positions[i + 1][1]:
+                    overlap_count += 1
+            if overlap_count > 0:
+                print(f"  !! 警告: 检测到 {overlap_count} 对任务时间窗口重叠 !!")
+            else:
+                print(f"  无人机任务时间窗口无重叠 (可行)")
 
 
 # ==================== 可视化 ====================
