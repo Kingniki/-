@@ -678,9 +678,9 @@ class ALNSSolver:
         arc_start = max(0, center_idx - ARC_WINDOW)
         arc_end = min(num_arcs, center_idx + ARC_WINDOW + 1)
 
-        # 排序的速度列表（用于智能速度选择）
-        sorted_speeds = sorted(self.instance.drone_speeds)
-        battery_limit = self.instance.battery_capacity * (1 - self.instance.safety_margin)
+        # 使用缓存的速度和电池参数
+        sorted_speeds = self.sorted_speeds
+        battery_limit = self.battery_limit
 
         # 阶段1: 粗筛lambda + 快速速度选择 -> 收集候选
         coarse_lambdas = [0.0, 0.3, 0.5, 0.7, 1.0]
@@ -875,28 +875,55 @@ class ALNSSolver:
         return removed
     
     def _worst_removal(self, solution: Solution) -> List[int]:
-        """最差移除算子"""
+        """
+        最差移除算子 (优化版)
+
+        改进: 使用增量成本估算代替完整解重评估
+        原版对每个客户做 copy+evaluate (O(n)次完整评估), 非常慢
+        现在用插入成本近似: saving ≈ detour_cost for truck, drone_cost for drone
+        """
         num_remove = self._get_removal_count(len(self.instance.customers))
-        
+        depot = self.instance.depot
+        drone_served = solution.get_drone_served_customers()
+
         savings = []
         for customer in self.instance.customers:
-            original_obj = solution.objective
-            test_solution = solution.copy()
-            self._remove_customers(test_solution, [customer])
-            self._ensure_closed_route(test_solution)
-            self._evaluate_solution(test_solution)
-            saving = original_obj - test_solution.objective
-            savings.append((customer, saving))
-        
+            if customer in drone_served:
+                # 无人机客户: 估算移除drone mission的节省
+                for mission in solution.drone_missions:
+                    if mission.customer == customer:
+                        customer_coords = self.instance.node_coords[customer]
+                        launch_pt = self.instance.get_point_on_arc(
+                            mission.launch_arc_start, mission.launch_arc_end, mission.lambda_launch)
+                        recover_pt = self.instance.get_point_on_arc(
+                            mission.recover_arc_start, mission.recover_arc_end, mission.lambda_recover)
+                        dist_out = self.instance.euclidean_distance(launch_pt, customer_coords)
+                        dist_ret = self.instance.euclidean_distance(customer_coords, recover_pt)
+                        saving = (dist_out + dist_ret) * self.instance.drone_cost
+                        savings.append((customer, saving))
+                        break
+            elif customer in solution.truck_route:
+                # 卡车客户: 估算移除的距离节省 (detour cost)
+                idx = solution.truck_route.index(customer)
+                if 0 < idx < len(solution.truck_route) - 1:
+                    prev_n = solution.truck_route[idx - 1]
+                    next_n = solution.truck_route[idx + 1]
+                    saving = (
+                        self.instance.dist.get((prev_n, customer), 0) +
+                        self.instance.dist.get((customer, next_n), 0) -
+                        self.instance.dist.get((prev_n, next_n), 0)
+                    ) * self.instance.truck_cost
+                    savings.append((customer, saving))
+
         savings.sort(key=lambda x: x[1], reverse=True)
-        
+
         removed = []
         for customer, _ in savings:
             if len(removed) >= num_remove:
                 break
             if self.rng.random() < 0.8:
                 removed.append(customer)
-        
+
         self._remove_customers(solution, removed)
         return removed
     
@@ -945,22 +972,27 @@ class ALNSSolver:
         return removed
     
     def _cluster_removal(self, solution: Solution) -> List[int]:
-        """聚类移除"""
+        """
+        聚类移除 (Sacramento Algorithm 3)
+
+        改进: 每步找2个最近客户, 随机选1个 (增加噪声, 避免相同偏解)
+        """
         num_remove = self._get_removal_count(len(self.instance.customers))
-        
+
         center = self.rng.choice(self.instance.customers)
-        center_coords = self.instance.node_coords[center]
-        
-        distances = []
-        for customer in self.instance.customers:
-            coords = self.instance.node_coords[customer]
-            dist = math.sqrt((coords[0] - center_coords[0])**2 + 
-                           (coords[1] - center_coords[1])**2)
-            distances.append((customer, dist))
-        
-        distances.sort(key=lambda x: x[1])
-        removed = [c for c, _ in distances[:num_remove]]
-        
+        removed = [center]
+        remaining = [c for c in self.instance.customers if c != center]
+
+        while len(removed) < num_remove and remaining:
+            center_coords = self.instance.node_coords[center]
+            # 按到中心距离排序
+            remaining.sort(key=lambda c: self.instance.dist.get((center, c), float('inf')))
+            # 找2个最近, 随机选1个 (Sacramento: 增加搜索多样性)
+            pick_from = remaining[:min(2, len(remaining))]
+            chosen = self.rng.choice(pick_from)
+            removed.append(chosen)
+            remaining.remove(chosen)
+
         self._remove_customers(solution, removed)
         return removed
     
@@ -1005,8 +1037,13 @@ class ALNSSolver:
                                    if m.customer not in customers]
 
     def _get_removal_count(self, total_customers: int) -> int:
-        """计算移除客户数量"""
+        """
+        计算移除客户数量
+
+        Sacramento: beta = min(max(psi*|C|, c_low), c_lim)
+        """
         max_removal = max(self.min_removal, int(total_customers * self.max_removal_ratio))
+        max_removal = min(max_removal, self.max_removal_cap)
         return self.rng.randint(self.min_removal, max_removal)
     
     # ==================== 修复算子 ====================
@@ -1148,8 +1185,8 @@ class ALNSSolver:
         payload = self.instance.demands.get(customer, 0)
         service_time = self.instance.service_times.get(customer, 0)
 
-        sorted_speeds = sorted(self.instance.drone_speeds)
-        battery_limit = self.instance.battery_capacity * (1 - self.instance.safety_margin)
+        sorted_speeds = self.sorted_speeds
+        battery_limit = self.battery_limit
 
         # 找离客户最近的弧作为搜索中心
         best_center = 0
@@ -1759,8 +1796,8 @@ def main():
         instance=instance,
         seed=SEED,
         max_iterations=MAX_ITERATIONS,
-        initial_temperature=100.0,
-        cooling_rate=0.9995,
+        # initial_temperature=None → 自适应: T_st = 0.004 * f(s_init)
+        # reaction_factor=0.9, max_removal_ratio=0.20, no_improve_max=1000
     )
     
     print("\n[3] 开始求解...")
