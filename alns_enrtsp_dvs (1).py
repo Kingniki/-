@@ -301,38 +301,49 @@ class ALNSSolver:
         seed: int = 42,
         max_iterations: int = 10000,
         segment_length: int = 100,
-        initial_temperature: float = 100.0,
-        cooling_rate: float = 0.9995,
+        initial_temperature: float = None,  # None = auto-calculate from initial solution
+        temp_factor: float = 0.004,         # Sacramento: T_st = alpha * f(s_init)
+        cooling_rate: float = 0.9995,       # Fallback geometric (linear cooling preferred)
         min_removal: int = 1,
-        max_removal_ratio: float = 0.4,
-        reaction_factor: float = 0.1,
+        max_removal_ratio: float = 0.20,    # Sacramento: psi=0.15, recommended 0.15-0.20
+        max_removal_cap: int = 40,          # Sacramento: c_lim=40
+        reaction_factor: float = 0.9,       # Sacramento: lambda=0.9 (was 0.1, way too low)
         sigma1: float = 33,
         sigma2: float = 9,
-        sigma3: float = 13
+        sigma3: float = 13,
+        no_improve_max: int = 1000,         # Sacramento: restore best after N no-improve
     ):
         self.instance = instance
         self.rng = random.Random(seed)
         np.random.seed(seed)
-        
+
         self.max_iterations = max_iterations
         self.segment_length = segment_length
         self.initial_temperature = initial_temperature
+        self.temp_factor = temp_factor
         self.cooling_rate = cooling_rate
         self.min_removal = min_removal
         self.max_removal_ratio = max_removal_ratio
+        self.max_removal_cap = max_removal_cap
         self.reaction_factor = reaction_factor
-        
+        self.no_improve_max = no_improve_max
+
         self.sigma1 = sigma1
         self.sigma2 = sigma2
         self.sigma3 = sigma3
-        
+
         self._init_operators()
-        
+
+        # Cache frequently used computations
+        self.sorted_speeds = sorted(self.instance.drone_speeds)
+        self.battery_limit = self.instance.battery_capacity * (1 - self.instance.safety_margin)
+
         self.stats = {
             'iterations': 0,
             'improvements': 0,
             'accepts': 0,
-            'best_found_iteration': 0
+            'best_found_iteration': 0,
+            'restorations': 0
         }
     
     def _init_operators(self):
@@ -361,48 +372,67 @@ class ALNSSolver:
         self.repair_usage = [0] * len(self.repair_operators)
     
     def solve(self, verbose: bool = True) -> Solution:
-        """执行ALNS求解"""
+        """
+        执行ALNS求解
+
+        改进 (基于 Sacramento et al., 2019):
+        - 自适应初始温度: T_st = alpha * f(s_init)
+        - 线性冷却: T = T_st * (1 - iter/max_iter)
+        - 恢复机制: 连续no_improve_max次无改进后恢复到最优解
+        - 反应因子 lambda=0.9 (快速适应算子性能)
+        - 破坏比例 psi=0.20 (适度破坏)
+        """
         start_time = time.time()
-        
+
         if verbose:
             print("=" * 60)
             print("ALNS求解 enRTSP-DVS 问题 (途中起飞模型)")
             print("=" * 60)
             print("\n[1] 构造初始解...")
-        
+
         current_solution = self._construct_initial_solution()
         best_solution = current_solution.copy()
-        
+
         if verbose:
             print(f"    初始解目标值: {current_solution.objective:.4f}")
             print(f"    卡车路线闭合: {current_solution.is_closed_route(self.instance.depot)}")
             print(f"    卡车服务客户数: {len(current_solution.get_truck_served_customers(self.instance.depot))}")
             print(f"    无人机任务数: {len(current_solution.drone_missions)}")
-        
-        temperature = self.initial_temperature
-        
+
+        # 自适应初始温度 (Sacramento: T_st = alpha * f(s_init))
+        if self.initial_temperature is None:
+            temperature = self.temp_factor * current_solution.objective
+            if len(self.instance.customers) < 20:
+                temperature *= 1.1  # Sacramento: 小实例提高10%避免过早收敛
+        else:
+            temperature = self.initial_temperature
+        initial_temp = temperature
+
         if verbose:
+            print(f"    初始温度: {temperature:.4f}")
             print(f"\n[2] 开始ALNS迭代 (最大迭代: {self.max_iterations})...")
-        
+
+        iter_no_improve = 0  # 连续无改进计数器
+
         for iteration in range(self.max_iterations):
             destroy_idx = self._select_operator(self.destroy_weights)
             repair_idx = self._select_operator(self.repair_weights)
-            
+
             destroy_name, destroy_op = self.destroy_operators[destroy_idx]
             repair_name, repair_op = self.repair_operators[repair_idx]
-            
+
             new_solution = current_solution.copy()
             removed_customers = destroy_op(new_solution)
             repair_op(new_solution, removed_customers)
-            
+
             # 确保路线闭合
             self._ensure_closed_route(new_solution)
-            
+
             self._evaluate_solution(new_solution)
-            
+
             self.destroy_usage[destroy_idx] += 1
             self.repair_usage[repair_idx] += 1
-            
+
             score = 0
             if new_solution.objective < best_solution.objective:
                 best_solution = new_solution.copy()
@@ -410,39 +440,58 @@ class ALNSSolver:
                 score = self.sigma1
                 self.stats['improvements'] += 1
                 self.stats['best_found_iteration'] = iteration
-                
+                iter_no_improve = 0
+
                 if verbose and iteration % 500 == 0:
                     print(f"    迭代 {iteration}: 新最优解 {best_solution.objective:.4f}")
-            
+
             elif new_solution.objective < current_solution.objective:
                 current_solution = new_solution
                 score = self.sigma2
                 self.stats['accepts'] += 1
-            
+                iter_no_improve = 0
+
             elif self._accept_worse(new_solution.objective - current_solution.objective, temperature):
                 current_solution = new_solution
                 score = self.sigma3
                 self.stats['accepts'] += 1
-            
+                iter_no_improve += 1
+
+            else:
+                iter_no_improve += 1
+
             self.destroy_scores[destroy_idx] += score
             self.repair_scores[repair_idx] += score
-            
+
             if (iteration + 1) % self.segment_length == 0:
                 self._update_weights()
-            
-            temperature *= self.cooling_rate
+
+            # 线性冷却 (Sacramento: T = T_st * (1 - t_elap/t_max))
+            progress = (iteration + 1) / self.max_iterations
+            temperature = initial_temp * (1 - progress)
+            temperature = max(temperature, 1e-6)  # 避免温度为0
+
+            # 恢复机制 (Sacramento: noImprovMax=1000)
+            if iter_no_improve >= self.no_improve_max:
+                current_solution = best_solution.copy()
+                iter_no_improve = 0
+                self.stats['restorations'] = self.stats.get('restorations', 0) + 1
+                if verbose:
+                    print(f"    迭代 {iteration}: 恢复到最优解 (连续{self.no_improve_max}次无改进)")
+
             self.stats['iterations'] = iteration + 1
-        
+
         elapsed_time = time.time() - start_time
-        
+
         if verbose:
             print(f"\n[3] ALNS求解完成!")
             print(f"    最终目标值: {best_solution.objective:.4f}")
             print(f"    总迭代次数: {self.stats['iterations']}")
             print(f"    改进次数: {self.stats['improvements']}")
             print(f"    最优解迭代: {self.stats['best_found_iteration']}")
+            print(f"    恢复次数: {self.stats.get('restorations', 0)}")
             print(f"    求解时间: {elapsed_time:.2f}秒")
-        
+
         return best_solution
     
     def _ensure_closed_route(self, solution: Solution):
