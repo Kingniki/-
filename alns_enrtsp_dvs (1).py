@@ -1640,16 +1640,25 @@ class ALNSSolver:
 
 # ==================== 可视化 ====================
 
-def visualize_solution(instance: EnRTSPDVSInstance, solution: Solution, 
+def visualize_solution(instance: EnRTSPDVSInstance, solution: Solution,
                        save_path: str = None):
-    """可视化解 - 正确显示途中起飞/降落"""
+    """
+    可视化解 - 正确显示途中起飞/降落
+
+    参数:
+        save_path: 图片保存路径。如果没有文件扩展名会自动加 .png
+                   如果传入的是目录路径，会在该目录下生成 enrtsp_dvs_solution.png
+    """
     try:
+        import matplotlib
+        matplotlib.use('Agg')  # 非交互式后端, 确保不依赖GUI即可保存
         import matplotlib.pyplot as plt
         import matplotlib.patches as mpatches
     except ImportError:
         print("matplotlib未安装，跳过可视化")
-        return
-    
+        print("安装: pip install matplotlib")
+        return None
+
     fig, ax = plt.subplots(figsize=(14, 12))
     
     depot = instance.depot
@@ -1745,12 +1754,30 @@ def visualize_solution(instance: EnRTSPDVSInstance, solution: Solution,
     ax.set_aspect('equal')
     
     plt.tight_layout()
-    
+
     if save_path:
+        import os
+        # 如果传入的是目录, 在目录下生成默认文件名
+        if os.path.isdir(save_path):
+            save_path = os.path.join(save_path, "enrtsp_dvs_solution.png")
+        # 确保有文件扩展名
+        _, ext = os.path.splitext(save_path)
+        if not ext:
+            save_path = save_path + ".png"
+        # 确保目录存在
+        save_dir = os.path.dirname(save_path)
+        if save_dir and not os.path.exists(save_dir):
+            os.makedirs(save_dir, exist_ok=True)
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
         print(f"图片已保存到: {save_path}")
-    
-    plt.show()
+
+    # 尝试显示 (非交互模式下不会阻塞)
+    try:
+        plt.show()
+    except Exception:
+        pass
+
+    plt.close(fig)
     return fig
 
 
@@ -1976,12 +2003,16 @@ def run_solomon_experiment(
         })
 
         # 可视化
-        if save_path:
-            try:
-                img_path = os.path.join(save_path, f"solomon_{num_c}customers")
-                visualize_solution(instance, solution, save_path=img_path)
-            except Exception as e:
-                print(f"  可视化失败: {e}")
+        try:
+            if save_path:
+                img_path = os.path.join(save_path, f"solomon_{num_c}customers.png")
+            else:
+                script_dir = os.path.dirname(os.path.abspath(__file__))
+                base_name = os.path.splitext(os.path.basename(filepath))[0]
+                img_path = os.path.join(script_dir, f"solomon_{base_name}_{num_c}.png")
+            visualize_solution(instance, solution, save_path=img_path)
+        except Exception as e:
+            print(f"  可视化失败: {e}")
 
     # 汇总报告
     print(f"\n\n{'='*70}")
@@ -2154,8 +2185,10 @@ def main():
     # 可视化
     print("\n[5] 生成可视化...")
     try:
-        visualize_solution(instance, solution,
-                          save_path=r"D:\研究生、\python\途中起飞+变速")
+        import os
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        img_path = os.path.join(script_dir, f"enrtsp_dvs_{NUM_CUSTOMERS}customers.png")
+        visualize_solution(instance, solution, save_path=img_path)
     except Exception as e:
         print(f"可视化失败: {e}")
 
@@ -2267,13 +2300,19 @@ def main_solomon():
             print(f"  改进百分比: {improvement:.2f}%")
 
         # 可视化
-        if SAVE_PATH:
-            print("\n[5] 生成可视化...")
-            try:
-                img_path = os.path.join(SAVE_PATH, f"solomon_c101_{SINGLE_NUM_CUSTOMERS}")
-                visualize_solution(instance, solution, save_path=img_path)
-            except Exception as e:
-                print(f"可视化失败: {e}")
+        print("\n[5] 生成可视化...")
+        try:
+            if SAVE_PATH:
+                base_name = os.path.splitext(os.path.basename(SOLOMON_FILE))[0]
+                img_path = os.path.join(SAVE_PATH, f"solomon_{base_name}_{SINGLE_NUM_CUSTOMERS}.png")
+            else:
+                # 默认保存到脚本所在目录
+                script_dir = os.path.dirname(os.path.abspath(__file__))
+                base_name = os.path.splitext(os.path.basename(SOLOMON_FILE))[0]
+                img_path = os.path.join(script_dir, f"solomon_{base_name}_{SINGLE_NUM_CUSTOMERS}.png")
+            visualize_solution(instance, solution, save_path=img_path)
+        except Exception as e:
+            print(f"可视化失败: {e}")
 
         return instance, solution, solver
 
