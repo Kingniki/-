@@ -236,6 +236,59 @@ class EnRTSPDVSInstance:
         demand = self.demands.get(customer, 0)
         return demand <= self.drone_max_load
 
+    def get_node_lambda_on_arc(self, node: int, arc_start: int, arc_end: int) -> float:
+        """
+        计算节点在弧上的lambda位置 [0,1]
+        通过距离比例: lambda = dist(arc_start, node) / dist(arc_start, arc_end)
+        """
+        d_total = self.dist.get((arc_start, arc_end), 0)
+        if d_total < 1e-9:
+            return 0.0
+        d_start_to_node = self.dist.get((arc_start, node), 0)
+        return min(1.0, max(0.0, d_start_to_node / d_total))
+
+    def calculate_truck_segment_time(
+        self, route: List[int], launch_arc_idx: int, recover_arc_idx: int,
+        lambda_launch: float, lambda_recover: float
+    ) -> float:
+        """
+        计算卡车从起飞点到回收点的行驶时间
+
+        Args:
+            route: 卡车路线节点列表
+            launch_arc_idx: 起飞弧在路线中的索引 (弧 route[idx]->route[idx+1])
+            recover_arc_idx: 回收弧在路线中的索引
+            lambda_launch: 起飞点在起飞弧上的位置 [0,1]
+            lambda_recover: 回收点在回收弧上的位置 [0,1]
+        """
+        total_time = 0.0
+
+        if launch_arc_idx == recover_arc_idx:
+            # 起飞和回收在同一条弧上
+            arc_start = route[launch_arc_idx]
+            arc_end = route[launch_arc_idx + 1]
+            full_time = self.truck_time.get((arc_start, arc_end), 0)
+            total_time = (lambda_recover - lambda_launch) * full_time
+            return max(0.0, total_time)
+
+        # 起飞弧的剩余部分
+        arc_s = route[launch_arc_idx]
+        arc_e = route[launch_arc_idx + 1]
+        full_time = self.truck_time.get((arc_s, arc_e), 0)
+        total_time += (1 - lambda_launch) * full_time
+
+        # 中间完整弧
+        for i in range(launch_arc_idx + 1, recover_arc_idx):
+            total_time += self.truck_time.get((route[i], route[i + 1]), 0)
+
+        # 回收弧的前半部分
+        arc_s = route[recover_arc_idx]
+        arc_e = route[recover_arc_idx + 1]
+        full_time = self.truck_time.get((arc_s, arc_e), 0)
+        total_time += lambda_recover * full_time
+
+        return total_time
+
 
 # ==================== ALNS算法核心 ====================
 
@@ -290,8 +343,9 @@ class ALNSSolver:
             ('shaw_removal', self._shaw_removal),
             ('drone_to_truck_removal', self._drone_to_truck_removal),
             ('cluster_removal', self._cluster_removal),
+            ('speed_reoptimize', self._speed_reoptimize_removal),
         ]
-        
+
         self.repair_operators = [
             ('greedy_insert', self._greedy_insert),
             ('regret_insert', self._regret_insert),
@@ -468,144 +522,197 @@ class ALNSSolver:
                     break
     
     def _initial_drone_assignment(self, solution: Solution):
-        """初始解中的无人机分配"""
-        # 获取卡车路线的弧
+        """
+        初始解中的无人机分配
+
+        改进: 使用完整路线弧验证, 允许同弧起飞/回收 (launch_idx <= recover_idx)
+        """
         arcs = solution.get_arcs()
-        
-        if len(arcs) < 2:
+
+        if len(arcs) < 1:
             return
-        
+
         # 找出适合无人机服务的客户
         candidates = []
-        
+
         for customer in self.instance.customers:
             if not self.instance.is_drone_eligible(customer):
                 continue
-            
-            # 找到客户在卡车路线中的位置
+
             if customer not in solution.truck_route:
                 continue
-            
+
             customer_idx = solution.truck_route.index(customer)
-            
-            # 尝试为该客户创建无人机任务
+
             best_mission, saving = self._find_best_drone_mission(solution, customer, customer_idx)
-            
+
             if best_mission is not None and saving > 0:
                 candidates.append((customer, customer_idx, best_mission, saving))
-        
+
         # 按节省排序
         candidates.sort(key=lambda x: x[3], reverse=True)
-        
+
         # 分配无人机任务
         assigned_customers = set()
         for customer, idx, mission, saving in candidates:
             if customer not in assigned_customers:
-                # 检查弧是否仍然存在
-                arcs = solution.get_arcs()
+                # 在完整路线弧中验证（含无人机客户节点）
+                current_arcs = solution.get_arcs()
                 launch_arc = (mission.launch_arc_start, mission.launch_arc_end)
                 recover_arc = (mission.recover_arc_start, mission.recover_arc_end)
-                
-                if launch_arc in arcs and recover_arc in arcs:
-                    launch_idx = arcs.index(launch_arc)
-                    recover_idx = arcs.index(recover_arc)
-                    
-                    if launch_idx < recover_idx:  # 起飞弧必须在回收弧之前
+
+                if launch_arc in current_arcs and recover_arc in current_arcs:
+                    launch_idx = current_arcs.index(launch_arc)
+                    recover_idx = current_arcs.index(recover_arc)
+
+                    if launch_idx <= recover_idx:  # 允许同弧（途中起飞同弧回收）
                         solution.drone_missions.append(mission)
                         assigned_customers.add(customer)
-        
+
         self._evaluate_solution(solution)
     
-    def _find_best_drone_mission(self, solution: Solution, customer: int, 
+    def _find_best_drone_mission(self, solution: Solution, customer: int,
                                   customer_idx: int) -> Tuple[Optional[DroneMission], float]:
-        """为客户找到最佳无人机任务"""
+        """
+        为客户找到最佳无人机任务（支持真正的途中起飞/降落和变速策略）
+
+        核心思路: 基于移除客户后的卡车路线搜索起飞/回收点,
+        确保无人机真正从弧的中间起飞和降落，而非在客户节点上。
+
+        改进点:
+        1. 在移除客户后的路线弧上搜索（真正的途中起飞）
+        2. 扩大搜索窗口到整条路线
+        3. 精细lambda搜索 (11个采样点 + 两阶段)
+        4. 遍历所有速度组合，基于时间同步选择最优速度
+        5. 考虑同步等待成本
+        """
         route = solution.truck_route
-        arcs = solution.get_arcs()
-        
+
         if customer_idx <= 0 or customer_idx >= len(route) - 1:
             return None, 0
-        
+
         best_mission = None
         best_saving = 0
-        
+
         # 计算从卡车路线移除客户的节省
         prev_node = route[customer_idx - 1]
         next_node = route[customer_idx + 1]
-        
+
         truck_detour_cost = (
             self.instance.dist.get((prev_node, customer), 0) +
             self.instance.dist.get((customer, next_node), 0) -
             self.instance.dist.get((prev_node, next_node), 0)
         ) * self.instance.truck_cost
-        
+
         customer_coords = self.instance.node_coords[customer]
-        
-        # 尝试不同的起飞弧和回收弧组合
-        for launch_arc_idx in range(max(0, customer_idx - 3), customer_idx):
-            for recover_arc_idx in range(customer_idx, min(len(arcs), customer_idx + 3)):
-                if launch_arc_idx >= recover_arc_idx:
+        payload = self.instance.demands.get(customer, 0)
+        service_time = self.instance.service_times.get(customer, 0)
+
+        # 构建移除客户后的路线和弧
+        reduced_route = [n for n in route if n != customer]
+        if len(reduced_route) < 2:
+            return None, 0
+        reduced_arcs = [(reduced_route[i], reduced_route[i+1])
+                        for i in range(len(reduced_route) - 1)]
+        num_arcs = len(reduced_arcs)
+        if num_arcs < 1:
+            return None, 0
+
+        max_arc_span = min(num_arcs, max(8, num_arcs))
+        lambda_values = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+
+        # 两阶段搜索
+        coarse_lambdas = [0.0, 0.3, 0.5, 0.7, 1.0]
+        candidates = []
+
+        for launch_arc_idx in range(num_arcs):
+            launch_arc = reduced_arcs[launch_arc_idx]
+            for recover_arc_idx in range(launch_arc_idx, min(num_arcs, launch_arc_idx + max_arc_span)):
+                recover_arc = reduced_arcs[recover_arc_idx]
+
+                # 粗筛: 用中间lambda测试距离可行性
+                mid_lam_l = coarse_lambdas[len(coarse_lambdas) // 2]
+                mid_lam_r = coarse_lambdas[len(coarse_lambdas) // 2]
+                lp = self.instance.get_point_on_arc(launch_arc[0], launch_arc[1], mid_lam_l)
+                rp = self.instance.get_point_on_arc(recover_arc[0], recover_arc[1], mid_lam_r)
+                d_out = self.instance.euclidean_distance(lp, customer_coords)
+                d_ret = self.instance.euclidean_distance(customer_coords, rp)
+
+                # 快速电池检查
+                min_speed = self.instance.drone_speeds[1] if len(self.instance.drone_speeds) > 1 \
+                    else self.instance.drone_speeds[0]
+                min_energy = self.instance.energy_model.energy_for_distance(
+                    payload, min_speed, d_out + d_ret)
+                if min_energy > self.instance.battery_capacity * (1 - self.instance.safety_margin) * 1.5:
                     continue
-                
-                launch_arc = arcs[launch_arc_idx]
-                recover_arc = arcs[recover_arc_idx]
-                
-                # 确保起飞弧和回收弧不包含客户节点本身
-                if customer in launch_arc or customer in recover_arc:
-                    continue
-                
-                # 尝试不同的lambda值
-                for lam_launch in [0.0, 0.3, 0.5, 0.7, 1.0]:
-                    for lam_recover in [0.0, 0.3, 0.5, 0.7, 1.0]:
-                        # 计算起飞点和回收点坐标
-                        launch_point = self.instance.get_point_on_arc(
-                            launch_arc[0], launch_arc[1], lam_launch)
-                        recover_point = self.instance.get_point_on_arc(
-                            recover_arc[0], recover_arc[1], lam_recover)
-                        
-                        # 计算飞行距离
-                        dist_out = self.instance.euclidean_distance(launch_point, customer_coords)
-                        dist_ret = self.instance.euclidean_distance(customer_coords, recover_point)
-                        
-                        # 选择速度
-                        payload = self.instance.demands.get(customer, 0)
-                        speed_out = self.instance.energy_model.get_optimal_speed(
-                            payload, self.instance.drone_speeds)
-                        speed_ret = self.instance.energy_model.get_optimal_speed(
-                            0, self.instance.drone_speeds)
-                        
-                        # 计算能耗
+
+                candidates.append((launch_arc_idx, recover_arc_idx))
+
+        # 阶段2: 精细搜索
+        for launch_arc_idx, recover_arc_idx in candidates:
+            launch_arc = reduced_arcs[launch_arc_idx]
+            recover_arc = reduced_arcs[recover_arc_idx]
+
+            for lam_launch in lambda_values:
+                launch_point = self.instance.get_point_on_arc(
+                    launch_arc[0], launch_arc[1], lam_launch)
+                dist_out = self.instance.euclidean_distance(launch_point, customer_coords)
+
+                for lam_recover in lambda_values:
+                    if launch_arc_idx == recover_arc_idx and lam_recover <= lam_launch:
+                        continue
+
+                    recover_point = self.instance.get_point_on_arc(
+                        recover_arc[0], recover_arc[1], lam_recover)
+                    dist_ret = self.instance.euclidean_distance(customer_coords, recover_point)
+
+                    # 卡车段时间（基于reduced_route）
+                    truck_segment_time = self.instance.calculate_truck_segment_time(
+                        reduced_route, launch_arc_idx, recover_arc_idx, lam_launch, lam_recover)
+
+                    # 遍历速度组合
+                    for speed_out in self.instance.drone_speeds:
                         energy_out = self.instance.energy_model.energy_for_distance(
                             payload, speed_out, dist_out)
-                        energy_ret = self.instance.energy_model.energy_for_distance(
-                            0, speed_ret, dist_ret)
-                        total_energy = energy_out + energy_ret
-                        
-                        # 检查电池约束
-                        if total_energy > self.instance.battery_capacity * (1 - self.instance.safety_margin):
-                            continue
-                        
-                        # 计算无人机成本
-                        drone_cost = (dist_out + dist_ret) * self.instance.drone_cost
-                        energy_cost = total_energy * self.instance.energy_cost
-                        total_drone_cost = drone_cost + energy_cost
-                        
-                        # 计算节省
-                        saving = truck_detour_cost - total_drone_cost
-                        
-                        if saving > best_saving:
-                            best_saving = saving
-                            best_mission = DroneMission(
-                                launch_arc_start=launch_arc[0],
-                                launch_arc_end=launch_arc[1],
-                                lambda_launch=lam_launch,
-                                customer=customer,
-                                recover_arc_start=recover_arc[0],
-                                recover_arc_end=recover_arc[1],
-                                lambda_recover=lam_recover,
-                                outbound_speed=speed_out,
-                                return_speed=speed_ret
-                            )
-        
+                        time_out = dist_out / speed_out if speed_out > 0 else float('inf')
+
+                        for speed_ret in self.instance.drone_speeds:
+                            energy_ret = self.instance.energy_model.energy_for_distance(
+                                0, speed_ret, dist_ret)
+                            total_energy = energy_out + energy_ret
+
+                            # 电池约束
+                            if total_energy > self.instance.battery_capacity * (1 - self.instance.safety_margin):
+                                continue
+
+                            time_ret = dist_ret / speed_ret if speed_ret > 0 else float('inf')
+                            drone_total_time = time_out + service_time + time_ret
+
+                            # 同步等待
+                            wait_time = abs(drone_total_time - truck_segment_time)
+                            wait_cost = wait_time * self.instance.wait_cost
+
+                            # 总无人机成本
+                            drone_dist_cost = (dist_out + dist_ret) * self.instance.drone_cost
+                            energy_cost_val = total_energy * self.instance.energy_cost
+                            total_drone_cost = drone_dist_cost + energy_cost_val + wait_cost
+
+                            saving = truck_detour_cost - total_drone_cost
+
+                            if saving > best_saving:
+                                best_saving = saving
+                                best_mission = DroneMission(
+                                    launch_arc_start=launch_arc[0],
+                                    launch_arc_end=launch_arc[1],
+                                    lambda_launch=lam_launch,
+                                    customer=customer,
+                                    recover_arc_start=recover_arc[0],
+                                    recover_arc_end=recover_arc[1],
+                                    lambda_recover=lam_recover,
+                                    outbound_speed=speed_out,
+                                    return_speed=speed_ret
+                                )
+
         return best_mission, best_saving
     
     # ==================== 破坏算子 ====================
@@ -708,18 +815,46 @@ class ALNSSolver:
         self._remove_customers(solution, removed)
         return removed
     
+    def _speed_reoptimize_removal(self, solution: Solution) -> List[int]:
+        """
+        速度重优化算子: 移除无人机任务中的客户并重新分配,
+        目的是通过重新搜索获得更好的速度组合和lambda位置
+        """
+        if not solution.drone_missions:
+            return self._random_removal(solution)
+
+        # 随机选取一部分无人机任务的客户
+        num_remove = min(
+            max(1, len(solution.drone_missions)),
+            self._get_removal_count(len(self.instance.customers))
+        )
+        missions_to_remove = self.rng.sample(
+            solution.drone_missions, min(num_remove, len(solution.drone_missions)))
+        removed = [m.customer for m in missions_to_remove]
+
+        # 移除这些drone任务
+        solution.drone_missions = [m for m in solution.drone_missions
+                                   if m not in missions_to_remove]
+
+        # 同时从卡车路线移除这些客户（由repair重新插入）
+        depot = self.instance.depot
+        solution.truck_route = [n for n in solution.truck_route
+                               if n == depot or n not in removed]
+
+        return removed
+
     def _remove_customers(self, solution: Solution, customers: List[int]):
         """从解中移除客户"""
         depot = self.instance.depot
-        
+
         # 从卡车路线中移除
-        solution.truck_route = [n for n in solution.truck_route 
+        solution.truck_route = [n for n in solution.truck_route
                                if n == depot or n not in customers]
-        
+
         # 移除相关的无人机任务
-        solution.drone_missions = [m for m in solution.drone_missions 
+        solution.drone_missions = [m for m in solution.drone_missions
                                    if m.customer not in customers]
-    
+
     def _get_removal_count(self, total_customers: int) -> int:
         """计算移除客户数量"""
         max_removal = max(self.min_removal, int(total_customers * self.max_removal_ratio))
@@ -779,36 +914,53 @@ class ALNSSolver:
         self._evaluate_solution(solution)
     
     def _drone_first_insert(self, solution: Solution, customers: List[int]):
-        """优先尝试无人机服务的修复算子"""
+        """
+        优先尝试无人机服务的修复算子
+
+        改进: 先在当前路线上尝试无人机任务（不插入客户到卡车路线），
+              成功则仅添加drone mission；失败则回退到卡车插入。
+        """
         remaining = customers.copy()
-        
-        # 首先尝试为每个客户分配无人机
+        drone_assigned = set()
+
+        # 阶段1: 对无人机可服务的客户，基于当前卡车路线尝试直接建立任务
         for customer in customers[:]:
             if not self.instance.is_drone_eligible(customer):
                 continue
-            
-            # 先插入到卡车路线
-            best_pos = 1
-            best_cost = float('inf')
-            for pos in range(1, len(solution.truck_route)):
-                cost = self._calculate_insertion_cost(solution, customer, pos)
-                if cost < best_cost:
-                    best_cost = cost
-                    best_pos = pos
-            
-            solution.truck_route.insert(best_pos, customer)
-            self._ensure_closed_route(solution)
-            
-            # 尝试创建无人机任务
-            customer_idx = solution.truck_route.index(customer)
-            mission, saving = self._find_best_drone_mission(solution, customer, customer_idx)
-            
+
+            # 基于当前路线寻找最佳drone任务（不需要customer在路线中）
+            mission, saving = self._find_best_drone_mission_external(
+                solution, customer)
+
             if mission is not None and saving > 0:
                 solution.drone_missions.append(mission)
-            
-            remaining.remove(customer)
-        
-        # 剩余客户用贪婪插入
+                drone_assigned.add(customer)
+                remaining.remove(customer)
+            else:
+                # 无人机不划算，先插入卡车路线再尝试
+                best_pos = 1
+                best_cost = float('inf')
+                for pos in range(1, len(solution.truck_route)):
+                    cost = self._calculate_insertion_cost(solution, customer, pos)
+                    if cost < best_cost:
+                        best_cost = cost
+                        best_pos = pos
+
+                solution.truck_route.insert(best_pos, customer)
+                self._ensure_closed_route(solution)
+
+                # 插入后再次尝试创建无人机任务
+                customer_idx = solution.truck_route.index(customer)
+                mission2, saving2 = self._find_best_drone_mission(
+                    solution, customer, customer_idx)
+
+                if mission2 is not None and saving2 > 0:
+                    solution.drone_missions.append(mission2)
+                    drone_assigned.add(customer)
+
+                remaining.remove(customer)
+
+        # 阶段2: 剩余客户贪婪插入卡车路线
         for customer in remaining:
             best_pos = 1
             best_cost = float('inf')
@@ -818,9 +970,97 @@ class ALNSSolver:
                     best_cost = cost
                     best_pos = pos
             solution.truck_route.insert(best_pos, customer)
-        
+
         self._ensure_closed_route(solution)
         self._evaluate_solution(solution)
+
+    def _find_best_drone_mission_external(
+        self, solution: Solution, customer: int
+    ) -> Tuple[Optional[DroneMission], float]:
+        """
+        为不在卡车路线中的客户寻找最佳无人机任务
+
+        直接基于当前卡车路线的弧结构搜索起飞/回收点,
+        不需要客户在路线中（真正的外部分配）
+        """
+        route = solution.truck_route
+        arcs = solution.get_arcs()
+        num_arcs = len(arcs)
+
+        if num_arcs < 1:
+            return None, 0
+
+        best_mission = None
+        best_cost = float('inf')
+
+        customer_coords = self.instance.node_coords[customer]
+        payload = self.instance.demands.get(customer, 0)
+        service_time = self.instance.service_times.get(customer, 0)
+
+        lambda_values = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
+
+        for launch_arc_idx in range(num_arcs):
+            launch_arc = arcs[launch_arc_idx]
+            for recover_arc_idx in range(launch_arc_idx, min(num_arcs, launch_arc_idx + 8)):
+                recover_arc = arcs[recover_arc_idx]
+
+                for lam_launch in lambda_values:
+                    launch_point = self.instance.get_point_on_arc(
+                        launch_arc[0], launch_arc[1], lam_launch)
+                    dist_out = self.instance.euclidean_distance(launch_point, customer_coords)
+
+                    for lam_recover in lambda_values:
+                        if launch_arc_idx == recover_arc_idx and lam_recover <= lam_launch:
+                            continue
+
+                        recover_point = self.instance.get_point_on_arc(
+                            recover_arc[0], recover_arc[1], lam_recover)
+                        dist_ret = self.instance.euclidean_distance(customer_coords, recover_point)
+
+                        truck_segment_time = self.instance.calculate_truck_segment_time(
+                            route, launch_arc_idx, recover_arc_idx, lam_launch, lam_recover)
+
+                        # 尝试速度组合（优化: 只试代表性速度）
+                        for speed_out in self.instance.drone_speeds:
+                            time_out = dist_out / speed_out
+                            energy_out = self.instance.energy_model.energy_for_distance(
+                                payload, speed_out, dist_out)
+
+                            for speed_ret in self.instance.drone_speeds:
+                                energy_ret = self.instance.energy_model.energy_for_distance(
+                                    0, speed_ret, dist_ret)
+                                total_energy = energy_out + energy_ret
+
+                                if total_energy > self.instance.battery_capacity * (1 - self.instance.safety_margin):
+                                    continue
+
+                                time_ret = dist_ret / speed_ret
+                                drone_total_time = time_out + service_time + time_ret
+                                wait_time = abs(drone_total_time - truck_segment_time)
+
+                                cost = ((dist_out + dist_ret) * self.instance.drone_cost +
+                                        total_energy * self.instance.energy_cost +
+                                        wait_time * self.instance.wait_cost)
+
+                                if cost < best_cost:
+                                    best_cost = cost
+                                    best_mission = DroneMission(
+                                        launch_arc_start=launch_arc[0],
+                                        launch_arc_end=launch_arc[1],
+                                        lambda_launch=lam_launch,
+                                        customer=customer,
+                                        recover_arc_start=recover_arc[0],
+                                        recover_arc_end=recover_arc[1],
+                                        lambda_recover=lam_recover,
+                                        outbound_speed=speed_out,
+                                        return_speed=speed_ret
+                                    )
+
+        # 返回 (mission, saving) -- saving 为正表示比不服务好
+        # 对外部客户，saving = 正值意味着成本低于某阈值
+        if best_mission is not None:
+            return best_mission, max(0, 50 - best_cost)  # 使用一个baseline阈值
+        return None, 0
     
     def _calculate_insertion_cost(self, solution: Solution, customer: int, pos: int) -> float:
         """计算在指定位置插入客户的成本"""
@@ -839,73 +1079,90 @@ class ALNSSolver:
     # ==================== 解评估 ====================
     
     def _evaluate_solution(self, solution: Solution):
-        """评估解的目标函数值"""
+        """
+        评估解的目标函数值
+
+        改进: 使用完整路线弧(含无人机客户)验证任务 + 同步等待成本
+        """
         total_cost = 0
         depot = self.instance.depot
-        
+
         # 获取无人机服务的客户
         drone_served = solution.get_drone_served_customers()
-        
+
         # 构建实际的卡车路线（跳过无人机服务的客户）
         actual_truck_route = []
         for node in solution.truck_route:
             if node == depot or node not in drone_served:
                 actual_truck_route.append(node)
-        
+
         # 确保路线闭合
         if actual_truck_route and actual_truck_route[0] != depot:
             actual_truck_route.insert(0, depot)
         if actual_truck_route and actual_truck_route[-1] != depot:
             actual_truck_route.append(depot)
-        
+
+        # 实际卡车弧（不含无人机客户）-- 任务弧基于此验证
+        actual_arcs = [(actual_truck_route[i], actual_truck_route[i+1])
+                       for i in range(len(actual_truck_route) - 1)]
+
         # 1. 卡车运输成本
         for i in range(len(actual_truck_route) - 1):
             dist = self.instance.dist.get((actual_truck_route[i], actual_truck_route[i+1]), 0)
             total_cost += dist * self.instance.truck_cost
-        
-        # 2. 无人机成本
-        actual_arcs = []
-        for i in range(len(actual_truck_route) - 1):
-            actual_arcs.append((actual_truck_route[i], actual_truck_route[i+1]))
-        
+
+        # 2. 无人机成本（基于实际卡车弧验证）
         for mission in solution.drone_missions:
             launch_arc = (mission.launch_arc_start, mission.launch_arc_end)
             recover_arc = (mission.recover_arc_start, mission.recover_arc_end)
-            
-            # 检查弧是否有效
+
+            # 在实际卡车弧中验证（任务是基于reduced route构建的）
             if launch_arc not in actual_arcs:
                 total_cost += 1e5
                 continue
             if recover_arc not in actual_arcs:
                 total_cost += 1e5
                 continue
-            
+
             launch_idx = actual_arcs.index(launch_arc)
             recover_idx = actual_arcs.index(recover_arc)
-            
-            if launch_idx >= recover_idx:
+
+            if launch_idx > recover_idx:
                 total_cost += 1e5
                 continue
-            
+
             # 计算飞行距离
             customer_coords = self.instance.node_coords[mission.customer]
             launch_point = self.instance.get_point_on_arc(
                 mission.launch_arc_start, mission.launch_arc_end, mission.lambda_launch)
             recover_point = self.instance.get_point_on_arc(
                 mission.recover_arc_start, mission.recover_arc_end, mission.lambda_recover)
-            
+
             dist_out = self.instance.euclidean_distance(launch_point, customer_coords)
             dist_ret = self.instance.euclidean_distance(customer_coords, recover_point)
-            
+
+            # 距离成本
             total_cost += (dist_out + dist_ret) * self.instance.drone_cost
-            
+
+            # 能耗成本
             payload = self.instance.demands.get(mission.customer, 0)
             energy_out = self.instance.energy_model.energy_for_distance(
                 payload, mission.outbound_speed, dist_out)
             energy_ret = self.instance.energy_model.energy_for_distance(
                 0, mission.return_speed, dist_ret)
             total_cost += (energy_out + energy_ret) * self.instance.energy_cost
-        
+
+            # 同步等待成本
+            service_time = self.instance.service_times.get(mission.customer, 0)
+            drone_time = (dist_out / mission.outbound_speed +
+                          service_time +
+                          dist_ret / mission.return_speed)
+            truck_segment_time = self.instance.calculate_truck_segment_time(
+                actual_truck_route, launch_idx, recover_idx,
+                mission.lambda_launch, mission.lambda_recover)
+            wait_time = abs(drone_time - truck_segment_time)
+            total_cost += wait_time * self.instance.wait_cost
+
         # 3. 检查可行性
         served = solution.get_truck_served_customers(depot) | drone_served
         unserved = set(self.instance.customers) - served
@@ -1016,31 +1273,83 @@ class ALNSSolver:
         print(f"  卡车服务的客户: {sorted(truck_served)}")
         
         # 打印无人机任务
+        # 速度使用统计
+        speed_usage = defaultdict(int)
+        total_wait = 0.0
+        mid_arc_count = 0
+
         print(f"\n无人机任务 ({len(solution.drone_missions)} 个):")
+        # 构建actual arcs for sync calculation (与 _evaluate_solution 一致)
+        actual_arcs_for_print = [(actual_truck_route[i], actual_truck_route[i+1])
+                                 for i in range(len(actual_truck_route) - 1)]
+
         for idx, mission in enumerate(solution.drone_missions, 1):
             customer_coords = self.instance.node_coords[mission.customer]
             launch_point = self.instance.get_point_on_arc(
                 mission.launch_arc_start, mission.launch_arc_end, mission.lambda_launch)
             recover_point = self.instance.get_point_on_arc(
                 mission.recover_arc_start, mission.recover_arc_end, mission.lambda_recover)
-            
+
             dist_out = self.instance.euclidean_distance(launch_point, customer_coords)
             dist_ret = self.instance.euclidean_distance(customer_coords, recover_point)
-            
+
             payload = self.instance.demands.get(mission.customer, 0)
             energy_out = self.instance.energy_model.energy_for_distance(
                 payload, mission.outbound_speed, dist_out)
             energy_ret = self.instance.energy_model.energy_for_distance(
                 0, mission.return_speed, dist_ret)
-            
+
+            # 同步计算
+            service_time = self.instance.service_times.get(mission.customer, 0)
+            drone_time = (dist_out / mission.outbound_speed + service_time +
+                          dist_ret / mission.return_speed)
+            launch_arc = (mission.launch_arc_start, mission.launch_arc_end)
+            recover_arc = (mission.recover_arc_start, mission.recover_arc_end)
+            l_idx = actual_arcs_for_print.index(launch_arc) if launch_arc in actual_arcs_for_print else 0
+            r_idx = actual_arcs_for_print.index(recover_arc) if recover_arc in actual_arcs_for_print else l_idx
+            truck_seg_time = self.instance.calculate_truck_segment_time(
+                actual_truck_route, l_idx, r_idx,
+                mission.lambda_launch, mission.lambda_recover)
+            wait = abs(drone_time - truck_seg_time)
+            total_wait += wait
+
+            # 途中起飞检测
+            is_mid_launch = 0 < mission.lambda_launch < 1
+            is_mid_recover = 0 < mission.lambda_recover < 1
+            if is_mid_launch or is_mid_recover:
+                mid_arc_count += 1
+
+            speed_usage[mission.outbound_speed] += 1
+            speed_usage[mission.return_speed] += 1
+
             print(f"\n  任务 {idx}: 服务客户 {mission.customer} (需求: {payload})")
-            print(f"    起飞: 弧({mission.launch_arc_start}->{mission.launch_arc_end})上 λ={mission.lambda_launch:.2f}")
+            print(f"    起飞: 弧({mission.launch_arc_start}->{mission.launch_arc_end})上 λ={mission.lambda_launch:.2f}"
+                  f"{'  [途中起飞]' if is_mid_launch else ''}")
             print(f"           坐标: ({launch_point[0]:.1f}, {launch_point[1]:.1f})")
-            print(f"    降落: 弧({mission.recover_arc_start}->{mission.recover_arc_end})上 λ={mission.lambda_recover:.2f}")
+            print(f"    降落: 弧({mission.recover_arc_start}->{mission.recover_arc_end})上 λ={mission.lambda_recover:.2f}"
+                  f"{'  [途中降落]' if is_mid_recover else ''}")
             print(f"           坐标: ({recover_point[0]:.1f}, {recover_point[1]:.1f})")
-            print(f"    去程: {dist_out:.1f}m @ {mission.outbound_speed:.1f}m/s")
-            print(f"    返程: {dist_ret:.1f}m @ {mission.return_speed:.1f}m/s")
+            print(f"    去程: {dist_out:.1f}m @ {mission.outbound_speed:.1f}m/s"
+                  f"  (飞行时间: {dist_out / mission.outbound_speed:.1f}s)")
+            print(f"    返程: {dist_ret:.1f}m @ {mission.return_speed:.1f}m/s"
+                  f"  (飞行时间: {dist_ret / mission.return_speed:.1f}s)")
             print(f"    能耗: {energy_out + energy_ret:.2f} Wh")
+            print(f"    同步: 无人机={drone_time:.1f}s, 卡车段={truck_seg_time:.1f}s, "
+                  f"等待={wait:.1f}s")
+
+        # 汇总统计
+        if solution.drone_missions:
+            print(f"\n  --- 无人机任务汇总 ---")
+            print(f"  途中起飞/降落任务数: {mid_arc_count}/{len(solution.drone_missions)}")
+            print(f"  总同步等待时间: {total_wait:.1f}s "
+                  f"(平均: {total_wait / len(solution.drone_missions):.1f}s)")
+            print(f"  速度使用分布: ", end="")
+            for spd in sorted(speed_usage.keys()):
+                print(f"{spd:.0f}m/s({speed_usage[spd]}次) ", end="")
+            print()
+            # 速度多样性
+            unique_speeds = len(speed_usage)
+            print(f"  使用了 {unique_speeds}/{len(self.instance.drone_speeds)} 种不同速度")
 
 
 # ==================== 可视化 ====================
