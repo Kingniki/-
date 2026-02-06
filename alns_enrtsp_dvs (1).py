@@ -177,7 +177,8 @@ class EnRTSPDVSInstance:
         drone_cost: float = 0.5,
         energy_cost: float = 0.1,
         wait_cost: float = 0.5,
-        safety_margin: float = 0.1
+        safety_margin: float = 0.1,
+        drone_prep_time: float = 10.0
     ):
         self.node_coords = node_coords
         self.customers = customers
@@ -185,19 +186,20 @@ class EnRTSPDVSInstance:
         self.demands = demands or {c: 1.0 for c in customers}
         self.time_windows = time_windows or {c: (0, 1e6) for c in customers}
         self.service_times = service_times or {c: 0 for c in customers}
-        
+
         self.drone_speeds = drone_speeds or [12.0, 15.0, 18.0, 22.0, 25.0, 30.0]
         self.truck_speed = truck_speed
         self.battery_capacity = battery_capacity
         self.drone_max_load = drone_max_load
         self.drone_empty_weight = drone_empty_weight
-        
+
         self.truck_cost = truck_cost
         self.drone_cost = drone_cost
         self.energy_cost = energy_cost
         self.wait_cost = wait_cost
         self.safety_margin = safety_margin
-        
+        self.drone_prep_time = drone_prep_time  # 无人机回收后的准备时间(秒)
+
         self._compute_distances()
         self.energy_model = SimpleDroneEnergyModel(drone_empty_weight, battery_capacity)
     
@@ -595,6 +597,53 @@ class ALNSSolver:
 
         return (start_pos, end_pos)
 
+    def _calculate_position_travel_time(
+        self, pos1: float, pos2: float, arcs: List[Tuple[int, int]]
+    ) -> float:
+        """
+        计算卡车从位置 pos1 到 pos2 的行驶时间(秒)
+
+        位置格式: arc_index + lambda (例如 2.7 表示第2条弧的λ=0.7处)
+        要求: pos1 <= pos2
+        """
+        if pos2 <= pos1:
+            return 0.0
+
+        arc_idx1 = int(pos1)
+        lambda1 = pos1 - arc_idx1
+        arc_idx2 = int(pos2)
+        lambda2 = pos2 - arc_idx2
+
+        # 边界检查
+        if arc_idx1 >= len(arcs) or arc_idx2 >= len(arcs):
+            return 0.0
+
+        total_time = 0.0
+
+        if arc_idx1 == arc_idx2:
+            # 在同一条弧上
+            arc = arcs[arc_idx1]
+            arc_time = self.instance.truck_time.get(arc, 0)
+            total_time = (lambda2 - lambda1) * arc_time
+        else:
+            # 起始弧的剩余部分
+            arc = arcs[arc_idx1]
+            arc_time = self.instance.truck_time.get(arc, 0)
+            total_time += (1 - lambda1) * arc_time
+
+            # 中间完整弧
+            for i in range(arc_idx1 + 1, arc_idx2):
+                if i < len(arcs):
+                    arc = arcs[i]
+                    total_time += self.instance.truck_time.get(arc, 0)
+
+            # 结束弧的前半部分
+            arc = arcs[arc_idx2]
+            arc_time = self.instance.truck_time.get(arc, 0)
+            total_time += lambda2 * arc_time
+
+        return total_time
+
     def _check_mission_overlap(
         self, new_mission: DroneMission,
         existing_missions: List[DroneMission],
@@ -603,16 +652,18 @@ class ALNSSolver:
         """
         检查新任务是否与已有任务在卡车路线上的时间窗口重叠
 
-        单无人机约束: 无人机必须从上一个任务回收后才能执行下一个任务
-        即任何两个任务的 [start_pos, end_pos] 区间不能重叠
+        单无人机约束:
+        1. 任何两个任务的 [start_pos, end_pos] 区间不能重叠
+        2. 连续任务之间需要满足准备时间 (drone_prep_time) 约束
 
-        返回: True 如果有重叠 (冲突), False 如果无重叠 (可行)
+        返回: True 如果有重叠或准备时间不足 (冲突), False 如果可行
         """
         new_pos = self._get_mission_route_position(new_mission, arcs)
         if new_pos is None:
             return True  # 弧不存在视为冲突
 
         new_start, new_end = new_pos
+        prep_time = self.instance.drone_prep_time
 
         for existing in existing_missions:
             ex_pos = self._get_mission_route_position(existing, arcs)
@@ -621,11 +672,24 @@ class ALNSSolver:
 
             ex_start, ex_end = ex_pos
 
-            # 两个区间重叠条件: start1 < end2 AND start2 < end1
+            # 1. 检查区间重叠: start1 < end2 AND start2 < end1
             if new_start < ex_end and ex_start < new_end:
                 return True  # 重叠
 
-        return False  # 无重叠
+            # 2. 检查准备时间约束
+            # 如果新任务在已有任务之后
+            if new_start >= ex_end:
+                gap_time = self._calculate_position_travel_time(ex_end, new_start, arcs)
+                if gap_time < prep_time:
+                    return True  # 准备时间不足
+
+            # 如果新任务在已有任务之前
+            if ex_start >= new_end:
+                gap_time = self._calculate_position_travel_time(new_end, ex_start, arcs)
+                if gap_time < prep_time:
+                    return True  # 准备时间不足
+
+        return False  # 无冲突
 
     def _initial_drone_assignment(self, solution: Solution):
         """
@@ -1420,8 +1484,8 @@ class ALNSSolver:
             wait_time = abs(drone_time - truck_segment_time)
             total_cost += wait_time * self.instance.wait_cost
 
-        # 3. 无人机任务不重叠约束
-        # 单无人机: 任何两个任务的路线区间不能重叠
+        # 3. 无人机任务不重叠约束 + 准备时间约束
+        # 单无人机: 任何两个任务的路线区间不能重叠, 且需要满足准备时间
         mission_positions = []
         for mission in solution.drone_missions:
             pos = self._get_mission_route_position(mission, actual_arcs)
@@ -1429,9 +1493,18 @@ class ALNSSolver:
                 mission_positions.append(pos)
 
         mission_positions.sort(key=lambda p: p[0])
+        prep_time = self.instance.drone_prep_time
         for i in range(len(mission_positions) - 1):
-            if mission_positions[i][1] > mission_positions[i + 1][0]:
+            prev_end = mission_positions[i][1]
+            next_start = mission_positions[i + 1][0]
+            # 检查重叠
+            if prev_end > next_start:
                 total_cost += 1e5  # 重叠惩罚
+            else:
+                # 检查准备时间
+                gap_time = self._calculate_position_travel_time(prev_end, next_start, actual_arcs)
+                if gap_time < prep_time:
+                    total_cost += 1e4  # 准备时间不足惩罚
 
         # 4. 检查可行性
         served = solution.get_truck_served_customers(depot) | drone_served
@@ -1621,7 +1694,7 @@ class ALNSSolver:
             unique_speeds = len(speed_usage)
             print(f"  使用了 {unique_speeds}/{len(self.instance.drone_speeds)} 种不同速度")
 
-            # 任务重叠检查
+            # 任务重叠检查 + 准备时间检查
             mission_positions = []
             for m in solution.drone_missions:
                 pos = self._get_mission_route_position(m, actual_arcs_for_print)
@@ -1629,13 +1702,24 @@ class ALNSSolver:
                     mission_positions.append((m.customer, pos[0], pos[1]))
             mission_positions.sort(key=lambda x: x[1])
             overlap_count = 0
+            prep_time_violation_count = 0
+            prep_time = self.instance.drone_prep_time
             for i in range(len(mission_positions) - 1):
-                if mission_positions[i][2] > mission_positions[i + 1][1]:
+                prev_end = mission_positions[i][2]
+                next_start = mission_positions[i + 1][1]
+                if prev_end > next_start:
                     overlap_count += 1
+                else:
+                    gap_time = self._calculate_position_travel_time(
+                        prev_end, next_start, actual_arcs_for_print)
+                    if gap_time < prep_time:
+                        prep_time_violation_count += 1
             if overlap_count > 0:
                 print(f"  !! 警告: 检测到 {overlap_count} 对任务时间窗口重叠 !!")
+            elif prep_time_violation_count > 0:
+                print(f"  !! 警告: {prep_time_violation_count} 对任务准备时间不足 (需{prep_time:.0f}s) !!")
             else:
-                print(f"  无人机任务时间窗口无重叠 (可行)")
+                print(f"  无人机任务时间窗口无重叠且满足准备时间({prep_time:.0f}s)约束 (可行)")
 
 
 # ==================== 可视化 ====================
@@ -1795,6 +1879,7 @@ def load_solomon_instance(
     energy_cost: float = 0.01,
     wait_cost: float = 0.5,
     coord_scale: float = 1.0,
+    drone_prep_time: float = 10.0,
 ) -> EnRTSPDVSInstance:
     """
     解析Solomon标准算例文件并转换为 EnRTSPDVSInstance
@@ -1821,6 +1906,7 @@ def load_solomon_instance(
         energy_cost: 无人机单位能耗成本
         wait_cost: 等待成本
         coord_scale: 坐标缩放因子 (Solomon坐标通常0-100, 可放大)
+        drone_prep_time: 无人机回收后的准备时间 (秒)
 
     返回:
         EnRTSPDVSInstance 实例
@@ -1920,6 +2006,7 @@ def load_solomon_instance(
         drone_cost=drone_cost,
         energy_cost=energy_cost,
         wait_cost=wait_cost,
+        drone_prep_time=drone_prep_time,
     )
 
 
@@ -1930,6 +2017,7 @@ def run_solomon_experiment(
     seed: int = 42,
     coord_scale: float = 10.0,
     save_path: str = None,
+    drone_prep_time: float = 10.0,
 ):
     """
     使用Solomon算例进行批量实验
@@ -1941,6 +2029,7 @@ def run_solomon_experiment(
         seed: 随机种子
         coord_scale: 坐标缩放因子 (Solomon坐标0-100较小, 建议放大10倍使距离更合理)
         save_path: 可视化图片保存路径 (None=不保存)
+        drone_prep_time: 无人机回收后的准备时间 (秒)
     """
     import os
 
@@ -1968,6 +2057,7 @@ def run_solomon_experiment(
             filepath,
             num_customers=num_c,
             coord_scale=coord_scale,
+            drone_prep_time=drone_prep_time,
         )
 
         print(f"\n[2] 求解...")
