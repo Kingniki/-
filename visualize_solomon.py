@@ -10,6 +10,11 @@ import matplotlib.pyplot as plt
 import numpy as np
 import os
 
+# ==================== 全局图片尺寸设置 ====================
+# 固定图片大小: 1920 x 1440 像素 (figsize * dpi)
+FIGURE_SIZE = (12.8, 9.6)   # 英寸
+FIGURE_DPI = 150             # 输出 1920 x 1440 px
+
 
 def parse_solomon_file(filepath: str):
     """
@@ -79,7 +84,6 @@ def visualize_solomon_nodes(
     show_time_windows: bool = False,
     show_customer_id: bool = True,
     num_customers: int = None,
-    figsize: tuple = (12, 10),
     title: str = None
 ):
     """
@@ -92,7 +96,6 @@ def visualize_solomon_nodes(
         show_time_windows: 是否显示时间窗信息
         show_customer_id: 是否显示客户编号
         num_customers: 只显示前N个客户 (None=全部)
-        figsize: 图片大小
         title: 自定义标题
     """
     # 解析文件
@@ -110,8 +113,8 @@ def visualize_solomon_nodes(
     print(f"客户数量: {len(customers)}")
     print(f"车辆数量: {data['vehicle_number']}, 容量: {data['vehicle_capacity']}")
 
-    # 创建图形
-    fig, ax = plt.subplots(figsize=figsize)
+    # 创建图形 (使用全局固定尺寸)
+    fig, ax = plt.subplots(figsize=FIGURE_SIZE)
 
     # 提取坐标
     depot_x, depot_y = depot[0], depot[1]
@@ -204,7 +207,7 @@ def visualize_solomon_nodes(
     if not save_path.endswith('.png'):
         save_path += '.png'
 
-    plt.savefig(save_path, dpi=150, bbox_inches='tight', facecolor='white')
+    plt.savefig(save_path, dpi=FIGURE_DPI, facecolor='white')
     print(f"\n图片已保存: {save_path}")
 
     plt.close(fig)
@@ -214,8 +217,7 @@ def visualize_solomon_nodes(
 def visualize_with_clusters(
     filepath: str,
     save_path: str = None,
-    num_customers: int = None,
-    figsize: tuple = (12, 10)
+    num_customers: int = None
 ):
     """
     按需求大小分组可视化（用颜色区分）
@@ -228,7 +230,7 @@ def visualize_with_clusters(
     if num_customers is not None:
         customers = customers[:num_customers]
 
-    fig, ax = plt.subplots(figsize=figsize)
+    fig, ax = plt.subplots(figsize=FIGURE_SIZE)
 
     # 绘制仓库
     depot_x, depot_y = depot[0], depot[1]
@@ -289,7 +291,7 @@ def visualize_with_clusters(
     if not save_path.endswith('.png'):
         save_path += '.png'
 
-    plt.savefig(save_path, dpi=150, bbox_inches='tight', facecolor='white')
+    plt.savefig(save_path, dpi=FIGURE_DPI, facecolor='white')
     print(f"图片已保存: {save_path}")
 
     plt.close(fig)
