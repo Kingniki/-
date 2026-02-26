@@ -15,6 +15,10 @@ import os
 FIGURE_SIZE = (12.8, 9.6)   # 英寸
 FIGURE_DPI = 150             # 输出 1920 x 1440 px
 
+# 固定坐标轴范围
+AXIS_X_RANGE = (0, 100)
+AXIS_Y_RANGE = (0, 100)
+
 
 def parse_solomon_file(filepath: str):
     """
@@ -156,15 +160,15 @@ def visualize_solomon_nodes(
             ax.annotate(f'[{int(ready)},{int(due)}]', (x, y + 2),
                        fontsize=6, ha='center', va='bottom', color='gray')
 
-    # 计算坐标范围
+    # 使用固定坐标范围
+    ax.set_xlim(AXIS_X_RANGE)
+    ax.set_ylim(AXIS_Y_RANGE)
+
+    # 计算实际坐标范围（用于统计信息）
     all_x = [depot_x] + cust_x
     all_y = [depot_y] + cust_y
     x_min, x_max = min(all_x), max(all_x)
     y_min, y_max = min(all_y), max(all_y)
-    padding = max(x_max - x_min, y_max - y_min) * 0.1
-
-    ax.set_xlim(x_min - padding, x_max + padding)
-    ax.set_ylim(y_min - padding, y_max + padding)
 
     # 设置标题和标签
     if title:
@@ -272,6 +276,10 @@ def visualize_with_clusters(
                   label=f'Large Demand (n={len(large)})')
         for x, y, cid in large:
             ax.annotate(str(cid), (x, y), fontsize=7, ha='center', va='center')
+
+    # 使用固定坐标范围
+    ax.set_xlim(AXIS_X_RANGE)
+    ax.set_ylim(AXIS_Y_RANGE)
 
     ax.set_title(f'Solomon Instance: {data["name"]} - Demand Distribution\n'
                 f'Customers: {len(customers)}', fontsize=12, fontweight='bold')
