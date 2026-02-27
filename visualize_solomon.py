@@ -11,9 +11,10 @@ import numpy as np
 import os
 
 # ==================== 全局图片尺寸设置 ====================
-# 固定图片大小: 1920 x 1440 像素 (figsize * dpi)
+# 固定图片大小
 FIGURE_SIZE = (12.8, 9.6)   # 英寸
-FIGURE_DPI = 150             # 输出 1920 x 1440 px
+FIGURE_DPI = 150
+FIGURE_FORMAT = 'svg'        # 输出格式: 'svg' 或 'png'
 
 # 固定坐标轴范围
 AXIS_X_RANGE = (0, 100)
@@ -206,12 +207,14 @@ def visualize_solomon_nodes(
     if save_path is None:
         base_name = os.path.splitext(os.path.basename(filepath))[0]
         save_dir = os.path.dirname(os.path.abspath(filepath))
-        save_path = os.path.join(save_dir, f"{base_name}_nodes.png")
+        save_path = os.path.join(save_dir, f"{base_name}_nodes.{FIGURE_FORMAT}")
 
-    if not save_path.endswith('.png'):
-        save_path += '.png'
+    # 确保扩展名正确
+    base, ext = os.path.splitext(save_path)
+    if ext.lower() not in ['.svg', '.png']:
+        save_path = f"{save_path}.{FIGURE_FORMAT}"
 
-    plt.savefig(save_path, dpi=FIGURE_DPI, facecolor='white')
+    plt.savefig(save_path, dpi=FIGURE_DPI, facecolor='white', format=FIGURE_FORMAT)
     print(f"\n图片已保存: {save_path}")
 
     plt.close(fig)
@@ -294,12 +297,14 @@ def visualize_with_clusters(
     if save_path is None:
         base_name = os.path.splitext(os.path.basename(filepath))[0]
         save_dir = os.path.dirname(os.path.abspath(filepath))
-        save_path = os.path.join(save_dir, f"{base_name}_demand_clusters.png")
+        save_path = os.path.join(save_dir, f"{base_name}_demand_clusters.{FIGURE_FORMAT}")
 
-    if not save_path.endswith('.png'):
-        save_path += '.png'
+    # 确保扩展名正确
+    base, ext = os.path.splitext(save_path)
+    if ext.lower() not in ['.svg', '.png']:
+        save_path = f"{save_path}.{FIGURE_FORMAT}"
 
-    plt.savefig(save_path, dpi=FIGURE_DPI, facecolor='white')
+    plt.savefig(save_path, dpi=FIGURE_DPI, facecolor='white', format=FIGURE_FORMAT)
     print(f"图片已保存: {save_path}")
 
     plt.close(fig)
