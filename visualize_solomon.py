@@ -7,8 +7,14 @@ Solomon算例客户节点可视化工具
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+from matplotlib import font_manager
 import numpy as np
 import os
+
+# ==================== 中文字体设置 ====================
+# 使用系统中文字体
+plt.rcParams['font.sans-serif'] = ['WenQuanYi Zen Hei', 'SimHei', 'DejaVu Sans']
+plt.rcParams['axes.unicode_minus'] = False  # 解决负号显示问题
 
 # ==================== 全局图片尺寸设置 ====================
 # 固定图片大小
@@ -139,14 +145,14 @@ def visualize_solomon_nodes(
 
     # 绘制仓库
     ax.scatter([depot_x], [depot_y], c='red', s=400, marker='s',
-               zorder=5, edgecolors='black', linewidths=2, label='Depot (0)')
+               zorder=5, edgecolors='black', linewidths=2, label='仓库 (0)')
     ax.annotate('D', (depot_x, depot_y), fontsize=14, ha='center', va='center',
                 fontweight='bold', color='white')
 
     # 绘制客户节点
     scatter = ax.scatter(cust_x, cust_y, c='steelblue', s=sizes, marker='o',
                         zorder=4, edgecolors='darkblue', linewidths=1,
-                        alpha=0.7, label='Customers')
+                        alpha=0.7, label='客户')
 
     # 显示客户编号
     if show_customer_id:
@@ -175,14 +181,14 @@ def visualize_solomon_nodes(
     if title:
         ax.set_title(title, fontsize=14, fontweight='bold')
     else:
-        ax.set_title(f'Solomon Instance: {instance_name}\n'
-                    f'Customers: {len(customers)}, '
-                    f'Vehicles: {data["vehicle_number"]}, '
-                    f'Capacity: {data["vehicle_capacity"]}',
+        ax.set_title(f'Solomon算例: {instance_name}\n'
+                    f'客户数: {len(customers)}, '
+                    f'车辆数: {data["vehicle_number"]}, '
+                    f'容量: {data["vehicle_capacity"]}',
                     fontsize=12, fontweight='bold')
 
-    ax.set_xlabel('X Coordinate', fontsize=11)
-    ax.set_ylabel('Y Coordinate', fontsize=11)
+    ax.set_xlabel('X坐标', fontsize=11)
+    ax.set_ylabel('Y坐标', fontsize=11)
 
     # 添加图例
     ax.legend(loc='upper right', fontsize=10)
@@ -192,10 +198,10 @@ def visualize_solomon_nodes(
     ax.set_aspect('equal')
 
     # 添加统计信息文本框
-    stats_text = (f"Total Customers: {len(customers)}\n"
-                  f"Demand Range: [{int(min(cust_demands))}, {int(max(cust_demands))}]\n"
-                  f"Total Demand: {int(sum(cust_demands))}\n"
-                  f"Coord Range: X[{x_min:.0f},{x_max:.0f}] Y[{y_min:.0f},{y_max:.0f}]")
+    stats_text = (f"客户总数: {len(customers)}\n"
+                  f"需求范围: [{int(min(cust_demands))}, {int(max(cust_demands))}]\n"
+                  f"总需求: {int(sum(cust_demands))}\n"
+                  f"坐标范围: X[{x_min:.0f},{x_max:.0f}] Y[{y_min:.0f},{y_max:.0f}]")
 
     props = dict(boxstyle='round', facecolor='wheat', alpha=0.8)
     ax.text(0.02, 0.98, stats_text, transform=ax.transAxes, fontsize=9,
@@ -242,7 +248,7 @@ def visualize_with_clusters(
     # 绘制仓库
     depot_x, depot_y = depot[0], depot[1]
     ax.scatter([depot_x], [depot_y], c='red', s=400, marker='s',
-               zorder=5, edgecolors='black', linewidths=2, label='Depot')
+               zorder=5, edgecolors='black', linewidths=2, label='仓库')
     ax.annotate('D', (depot_x, depot_y), fontsize=14, ha='center', va='center',
                 fontweight='bold', color='white')
 
@@ -260,7 +266,7 @@ def visualize_with_clusters(
         ax.scatter([p[0] for p in small], [p[1] for p in small],
                   c='lightgreen', s=80, marker='o', zorder=4,
                   edgecolors='green', linewidths=1,
-                  label=f'Small Demand (n={len(small)})')
+                  label=f'小需求 (n={len(small)})')
         for x, y, cid in small:
             ax.annotate(str(cid), (x, y), fontsize=7, ha='center', va='center')
 
@@ -268,7 +274,7 @@ def visualize_with_clusters(
         ax.scatter([p[0] for p in medium], [p[1] for p in medium],
                   c='orange', s=120, marker='o', zorder=4,
                   edgecolors='darkorange', linewidths=1,
-                  label=f'Medium Demand (n={len(medium)})')
+                  label=f'中需求 (n={len(medium)})')
         for x, y, cid in medium:
             ax.annotate(str(cid), (x, y), fontsize=7, ha='center', va='center')
 
@@ -276,7 +282,7 @@ def visualize_with_clusters(
         ax.scatter([p[0] for p in large], [p[1] for p in large],
                   c='tomato', s=180, marker='o', zorder=4,
                   edgecolors='darkred', linewidths=1,
-                  label=f'Large Demand (n={len(large)})')
+                  label=f'大需求 (n={len(large)})')
         for x, y, cid in large:
             ax.annotate(str(cid), (x, y), fontsize=7, ha='center', va='center')
 
@@ -284,10 +290,10 @@ def visualize_with_clusters(
     ax.set_xlim(AXIS_X_RANGE)
     ax.set_ylim(AXIS_Y_RANGE)
 
-    ax.set_title(f'Solomon Instance: {data["name"]} - Demand Distribution\n'
-                f'Customers: {len(customers)}', fontsize=12, fontweight='bold')
-    ax.set_xlabel('X Coordinate', fontsize=11)
-    ax.set_ylabel('Y Coordinate', fontsize=11)
+    ax.set_title(f'Solomon算例: {data["name"]} - 需求分布\n'
+                f'客户数: {len(customers)}', fontsize=12, fontweight='bold')
+    ax.set_xlabel('X坐标', fontsize=11)
+    ax.set_ylabel('Y坐标', fontsize=11)
     ax.legend(loc='upper right', fontsize=10)
     ax.grid(True, alpha=0.3, linestyle='--')
     ax.set_aspect('equal')
